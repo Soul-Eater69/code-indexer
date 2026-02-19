@@ -1,0 +1,68 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# Docker Compose for code-indexer + optional dependencies
+#
+# Profiles:
+#   default  – code-indexer API + ChromaDB (file-based, no server needed)
+#   qdrant   – code-indexer API + Qdrant vector store
+#
+# Usage:
+#   docker compose up                          # default (ChromaDB)
+#   docker compose --profile qdrant up         # with Qdrant
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Code Indexer API ──────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: code-indexer:latest
+    container_name: code-indexer-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - ../.env
+    environment:
+      # Override vector store host when running inside Docker.
+      - VECTORSTORE_QDRANT_URL=http://qdrant:6333
+    volumes:
+      # Persist ChromaDB data.
+      - chroma_data:/app/.chroma
+      # Mount your codebase so the API can index it.
+      # Override CODE_PATH in your .env file.
+      - ${CODE_PATH:-../}:/code:ro
+    depends_on:
+      qdrant:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ── Qdrant Vector Store (optional, enable with --profile qdrant) ───
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    profiles: ["qdrant"]
+    ports:
+      - "6333:6333"   # HTTP REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+  qdrant_data:

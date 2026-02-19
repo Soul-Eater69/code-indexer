@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment secrets
+.env
+*.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing and coverage
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.coveragerc
+
+# Mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Vector store data
+.chroma/
+qdrant_data/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Distribution
+*.tar.gz
