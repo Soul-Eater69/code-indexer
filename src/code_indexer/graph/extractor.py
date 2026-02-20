@@ -51,6 +51,294 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Built-in / noise call name sets
+#
+# Inspired by GitNexus's isBuiltInOrNoise pattern.  Filtering these names
+# from extracted calls keeps the graph focused on user-defined symbols and
+# dramatically reduces noise edges.
+# ---------------------------------------------------------------------------
+
+_PYTHON_BUILT_INS: frozenset[str] = frozenset(
+    {
+        # Built-in functions
+        "print",
+        "len",
+        "range",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "isinstance",
+        "issubclass",
+        "type",
+        "id",
+        "hash",
+        "repr",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "bytes",
+        "bytearray",
+        "memoryview",
+        "complex",
+        "frozenset",
+        "object",
+        "super",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "abs",
+        "all",
+        "any",
+        "bin",
+        "chr",
+        "dir",
+        "divmod",
+        "format",
+        "getattr",
+        "globals",
+        "hasattr",
+        "help",
+        "hex",
+        "input",
+        "iter",
+        "locals",
+        "max",
+        "min",
+        "next",
+        "oct",
+        "open",
+        "ord",
+        "pow",
+        "round",
+        "setattr",
+        "slice",
+        "sorted",
+        "sum",
+        "vars",
+        "callable",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "exit",
+        "quit",
+        "breakpoint",
+        # Overly generic method names
+        "append",
+        "extend",
+        "update",
+        "get",
+        "set",
+        "add",
+        "remove",
+        "pop",
+        "clear",
+        "copy",
+        "values",
+        "keys",
+        "items",
+        "join",
+        "split",
+        "strip",
+        "lstrip",
+        "rstrip",
+        "startswith",
+        "endswith",
+        "replace",
+        "encode",
+        "decode",
+        "read",
+        "write",
+        "close",
+        "seek",
+        "tell",
+        "flush",
+    }
+)
+
+_JS_BUILT_INS: frozenset[str] = frozenset(
+    {
+        # Console / logging
+        "log",
+        "warn",
+        "error",
+        "info",
+        "debug",
+        "trace",
+        # Array methods
+        "map",
+        "filter",
+        "reduce",
+        "forEach",
+        "find",
+        "findIndex",
+        "some",
+        "every",
+        "flat",
+        "flatMap",
+        "includes",
+        "indexOf",
+        "join",
+        "slice",
+        "splice",
+        "push",
+        "pop",
+        "shift",
+        "unshift",
+        "concat",
+        "sort",
+        "reverse",
+        "fill",
+        "copyWithin",
+        # Object methods
+        "keys",
+        "values",
+        "entries",
+        "assign",
+        "create",
+        "freeze",
+        "defineProperty",
+        "getOwnPropertyNames",
+        # String methods
+        "toString",
+        "toUpperCase",
+        "toLowerCase",
+        "trim",
+        "trimStart",
+        "trimEnd",
+        "padStart",
+        "padEnd",
+        "repeat",
+        "startsWith",
+        "endsWith",
+        "replace",
+        "replaceAll",
+        "split",
+        "match",
+        "search",
+        "indexOf",
+        "lastIndexOf",
+        "charAt",
+        "charCodeAt",
+        "substring",
+        # Promise / async
+        "then",
+        "catch",
+        "finally",
+        "resolve",
+        "reject",
+        "all",
+        "allSettled",
+        "race",
+        "any",
+        # React hooks
+        "useState",
+        "useEffect",
+        "useCallback",
+        "useMemo",
+        "useRef",
+        "useContext",
+        "useReducer",
+        "useLayoutEffect",
+        # Global utilities
+        "setTimeout",
+        "setInterval",
+        "clearTimeout",
+        "clearInterval",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "require",
+        # DOM
+        "getElementById",
+        "querySelector",
+        "querySelectorAll",
+        "addEventListener",
+        "removeEventListener",
+        "getAttribute",
+        "setAttribute",
+        "get",
+        "set",
+        "add",
+        "delete",
+        "has",
+        "clear",
+        "size",
+    }
+)
+
+_RUST_BUILT_INS: frozenset[str] = frozenset(
+    {
+        "println",
+        "print",
+        "eprintln",
+        "eprint",
+        "format",
+        "panic",
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "debug_assert",
+        "vec",
+        "len",
+        "push",
+        "pop",
+        "insert",
+        "remove",
+        "get",
+        "iter",
+        "iter_mut",
+        "into_iter",
+        "map",
+        "filter",
+        "collect",
+        "unwrap",
+        "expect",
+        "ok",
+        "err",
+        "is_some",
+        "is_none",
+        "is_ok",
+        "is_err",
+        "clone",
+        "into",
+        "from",
+        "to_string",
+        "to_owned",
+        "as_str",
+        "as_bytes",
+        "contains",
+        "starts_with",
+        "ends_with",
+        "replace",
+        "split",
+        "trim",
+    }
+)
+
+
+def _is_noise_call(name: str, language: "Language") -> bool:
+    """Return True if ``name`` is a built-in or too-generic call to index."""
+    if language == Language.PYTHON:
+        return name in _PYTHON_BUILT_INS
+    elif language in (Language.JAVASCRIPT, Language.TYPESCRIPT):
+        return name in _JS_BUILT_INS
+    elif language == Language.RUST:
+        return name in _RUST_BUILT_INS
+    # Single-letter names are always noise
+    return len(name) <= 1
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -173,14 +461,17 @@ def _python_extract_calls(root: Any, src: bytes) -> list[RawCall]:
             if func_node is None:
                 continue
             if func_node.type == "identifier":
-                calls.append(
-                    RawCall(callee_name=_node_text(func_node, src), line=_start_line(node))
-                )
+                name = _node_text(func_node, src)
+                if name in _PYTHON_BUILT_INS:
+                    continue  # skip noise
+                calls.append(RawCall(callee_name=name, line=_start_line(node)))
             elif func_node.type == "attribute":
                 obj_node = _first_named_child(func_node)
                 attr_node = _child_of_type(func_node, "identifier")
                 obj_name = _node_text(obj_node, src) if obj_node else None
                 attr_name = _node_text(attr_node, src) if attr_node else ""
+                if attr_name in _PYTHON_BUILT_INS:
+                    continue  # skip noise method calls
                 calls.append(
                     RawCall(
                         callee_name=attr_name,
@@ -348,15 +639,19 @@ def _js_extract_calls(root: Any, src: bytes) -> list[RawCall]:
             if func is None:
                 continue
             if func.type == "identifier":
-                calls.append(
-                    RawCall(callee_name=_node_text(func, src), line=_start_line(node))
-                )
+                name = _node_text(func, src)
+                if name in _JS_BUILT_INS:
+                    continue  # skip noise
+                calls.append(RawCall(callee_name=name, line=_start_line(node)))
             elif func.type == "member_expression":
                 obj = _first_named_child(func)
                 prop = _child_of_type(func, "property_identifier", "identifier")
+                prop_name = _node_text(prop, src) if prop else ""
+                if prop_name in _JS_BUILT_INS:
+                    continue  # skip noise method calls
                 calls.append(
                     RawCall(
-                        callee_name=_node_text(prop, src) if prop else "",
+                        callee_name=prop_name,
                         callee_object=_node_text(obj, src) if obj else None,
                         line=_start_line(node),
                     )
@@ -524,15 +819,19 @@ def _rust_extract_calls(root: Any, src: bytes) -> list[RawCall]:
             if func is None:
                 continue
             if func.type == "identifier":
-                calls.append(
-                    RawCall(callee_name=_node_text(func, src), line=_start_line(node))
-                )
+                name = _node_text(func, src)
+                if name in _RUST_BUILT_INS:
+                    continue  # skip noise
+                calls.append(RawCall(callee_name=name, line=_start_line(node)))
             elif func.type == "scoped_identifier":
                 # module::function
                 path_parts = _node_text(func, src).rsplit("::", 1)
+                callee = path_parts[-1]
+                if callee in _RUST_BUILT_INS:
+                    continue  # skip noise
                 calls.append(
                     RawCall(
-                        callee_name=path_parts[-1],
+                        callee_name=callee,
                         callee_object=path_parts[0] if len(path_parts) > 1 else None,
                         line=_start_line(node),
                     )
@@ -540,9 +839,12 @@ def _rust_extract_calls(root: Any, src: bytes) -> list[RawCall]:
             elif func.type == "field_expression":
                 field = _child_of_type(func, "field_identifier")
                 obj = _first_named_child(func)
+                field_name = _node_text(field, src) if field else ""
+                if field_name in _RUST_BUILT_INS:
+                    continue  # skip noise
                 calls.append(
                     RawCall(
-                        callee_name=_node_text(field, src) if field else "",
+                        callee_name=field_name,
                         callee_object=_node_text(obj, src) if obj else None,
                         line=_start_line(node),
                     )
@@ -550,9 +852,12 @@ def _rust_extract_calls(root: Any, src: bytes) -> list[RawCall]:
         elif node.type == "method_call_expression":
             method = _child_of_type(node, "field_identifier")
             receiver = _first_named_child(node)
+            method_name = _node_text(method, src) if method else ""
+            if method_name in _RUST_BUILT_INS:
+                continue  # skip noise
             calls.append(
                 RawCall(
-                    callee_name=_node_text(method, src) if method else "",
+                    callee_name=method_name,
                     callee_object=_node_text(receiver, src) if receiver else None,
                     line=_start_line(node),
                 )

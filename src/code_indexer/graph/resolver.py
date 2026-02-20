@@ -71,11 +71,21 @@ class ImportResolver:
         self._file_map = {
             posixpath.normpath(k).lstrip("./"): v for k, v in file_map.items()
         }
-        # Also index by basename for loose matching
+        # Stem index: strip extension → list[path]  (used by _by_stem)
         self._by_stem: dict[str, list[str]] = {}
+        # Suffix index (GitNexus pattern): every trailing sub-path of a stem
+        # maps to the file.  Allows O(1) resolution of partial import paths
+        # like ``from auth import jwt`` finding ``myapp/auth/jwt.py``.
+        # Built once at construction time; lookups are O(1) dict accesses.
+        self._suffix_index: dict[str, list["FileNode"]] = {}
         for path in self._file_map:
             stem = posixpath.splitext(path)[0]
             self._by_stem.setdefault(stem, []).append(path)
+            # Register every suffix of the stem
+            parts = stem.split("/")
+            for i in range(len(parts)):
+                suffix = "/".join(parts[i:])
+                self._suffix_index.setdefault(suffix, []).append(self._file_map[path])
 
     # ------------------------------------------------------------------
     # Public API
@@ -154,7 +164,8 @@ class ImportResolver:
                 result = self._try_extensions(candidate, Language.PYTHON)
                 if result:
                     return result
-            return None
+            # Final fallback: suffix index (O(1), handles deep monorepo nesting)
+            return self._try_suffix_index(module_string)
 
     def _resolve_js(
         self, module_string: str, importing_path: str
@@ -222,7 +233,11 @@ class ImportResolver:
         # Strip wildcard
         clean = module_string.rstrip(".*")
         as_path = clean.replace(".", "/")
-        return self._try_extensions(as_path, Language.JAVA)
+        result = self._try_extensions(as_path, Language.JAVA)
+        if result:
+            return result
+        # Fallback: suffix index handles partial package paths
+        return self._try_suffix_index(clean)
 
     # ------------------------------------------------------------------
     # Helper
@@ -243,4 +258,22 @@ class ImportResolver:
             if candidate in self._file_map:
                 return self._file_map[candidate]
 
+        return None
+
+    def _try_suffix_index(self, module_string: str) -> "FileNode | None":
+        """Look up ``module_string`` in the suffix index.
+
+        Converts dotted or slash-separated import paths to a suffix key
+        and returns the unique matching :class:`FileNode`, or ``None`` if
+        no match or multiple matches exist (ambiguous).
+
+        This enables O(1) resolution of imports like ``import auth.jwt``
+        when the file lives at ``myapp/services/auth/jwt.py`` without
+        iterating the entire file map.
+        """
+        # Normalise: dots → slashes (Python / Java style)
+        key = module_string.replace(".", "/").strip("/")
+        candidates = self._suffix_index.get(key)
+        if candidates and len(candidates) == 1:
+            return candidates[0]
         return None

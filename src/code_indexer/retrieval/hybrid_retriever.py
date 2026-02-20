@@ -15,14 +15,15 @@ Stage 2 — **Graph expansion** (:class:`BaseGraphStore`):
   * **Sibling methods** of the parent class.
   * **Base classes** (one level of inheritance).
 
-  The expanded chunks are de-duplicated and re-ranked by a combined score::
+Stage 3 — **Reciprocal Rank Fusion (RRF)**:
+  Inspired by GitNexus's hybrid-search implementation.  Each result list
+  (vector and graph) contributes a rank-based score::
 
-      combined_score = vector_score * vector_weight
-                     + graph_score  * (1 - vector_weight)
+      rrf_score(d) = Σ_list  1 / (RRF_K + rank_in_list)
 
-  where ``graph_score`` is a fixed value assigned to graph-expanded results
-  (default ``0.6``) to indicate that they are structurally related but
-  not directly similar by embedding distance.
+  where ``RRF_K = 60`` (standard constant).  Items that appear in both
+  lists accumulate scores from both, naturally surfacing results that are
+  both semantically similar *and* structurally related.
 
 Usage::
 
@@ -54,8 +55,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Score assigned to graph-expanded chunks that did not appear in vector results.
-_GRAPH_EXPANSION_SCORE = 0.6
+# RRF constant — standard value from Cormack et al. (2009).
+# Increasing k reduces the impact of high-ranked results; 60 is the well-tested default.
+_RRF_K = 60
 
 
 class HybridRetriever:
@@ -70,8 +72,8 @@ class HybridRetriever:
     graph_store:
         Code knowledge graph store.
     vector_weight:
-        Weight for vector similarity score in [0, 1].
-        ``1.0`` = pure vector search.  ``0.0`` = pure graph expansion.
+        Controls expansion breadth; does not affect the final RRF ranking
+        (which is rank-based, not score-based).  Kept for API compatibility.
     graph_expansion_hops:
         How many hops to traverse in the call graph for expansion.
         ``1`` = direct callers/callees only.
@@ -200,12 +202,12 @@ class HybridRetriever:
                     if related_result.chunk.id in seen_chunk_ids:
                         continue
                     seen_chunk_ids.add(related_result.chunk.id)
-                    # Assign a combined score: lower than direct match
+                    # Preserve the raw vector score; RRF in _merge_and_rank
+                    # will assign the final combined score via rank fusion.
                     graph_result = SearchResult(
                         chunk=related_result.chunk,
-                        score=_GRAPH_EXPANSION_SCORE * self._graph_weight
-                        + related_result.score * self._vector_weight,
-                        rank=0,  # will be reassigned in merge
+                        score=related_result.score,
+                        rank=0,  # reassigned in _merge_and_rank
                     )
                     extra.append(graph_result)
                     expansions_added += 1
@@ -218,35 +220,48 @@ class HybridRetriever:
         graph_results: list[SearchResult],
         top_k: int,
     ) -> list[SearchResult]:
-        """Merge vector + graph results, re-weight scores, and return top_k."""
-        # Adjust vector result scores
-        weighted: list[SearchResult] = []
-        seen: set[str] = set()
+        """Merge vector + graph results using Reciprocal Rank Fusion (RRF).
 
-        for r in vector_results:
-            if r.chunk.id in seen:
-                continue
-            seen.add(r.chunk.id)
-            weighted.append(
+        RRF score for a chunk c::
+
+            rrf(c) = Σ_list  1 / (RRF_K + rank_in_list(c))
+
+        Chunks appearing in both lists accumulate scores from both,
+        naturally promoting results that are semantically *and*
+        structurally relevant.  This replaces the previous simple
+        weighted-sum approach.
+        """
+        # Accumulate RRF scores keyed by chunk.id
+        rrf_scores: dict[str, float] = {}
+        # Track the best SearchResult object per chunk (for the chunk data)
+        best_result: dict[str, SearchResult] = {}
+
+        # Vector list contribution (1-indexed ranks)
+        for rank, r in enumerate(vector_results, start=1):
+            cid = r.chunk.id
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (_RRF_K + rank)
+            # Always keep the vector result as the primary source
+            if cid not in best_result or r.score > best_result[cid].score:
+                best_result[cid] = r
+
+        # Graph expansion contribution (1-indexed ranks)
+        for rank, r in enumerate(graph_results, start=1):
+            cid = r.chunk.id
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (_RRF_K + rank)
+            if cid not in best_result:
+                best_result[cid] = r
+
+        # Build final list sorted by RRF score
+        sorted_ids = sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)
+        top = []
+        for final_rank, cid in enumerate(sorted_ids[:top_k], start=1):
+            src = best_result[cid]
+            top.append(
                 SearchResult(
-                    chunk=r.chunk,
-                    score=r.score * self._vector_weight,
-                    rank=0,
+                    chunk=src.chunk,
+                    score=rrf_scores[cid],
+                    rank=final_rank,
                 )
             )
-
-        for r in graph_results:
-            if r.chunk.id in seen:
-                continue
-            seen.add(r.chunk.id)
-            weighted.append(r)
-
-        # Sort by combined score descending
-        weighted.sort(key=lambda r: r.score, reverse=True)
-        top = weighted[:top_k]
-
-        # Assign final ranks
-        for i, r in enumerate(top):
-            r.rank = i + 1
 
         return top

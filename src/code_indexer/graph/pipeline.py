@@ -345,7 +345,19 @@ class GraphIndexingPipeline:
         for sn in snapshot.symbol_nodes.values():
             global_name_index.setdefault(sn.name, []).append(sn)
 
-        # Now link calls within each file
+        # Build per-file import target set from edges already assembled.
+        # Used to boost confidence when the callee lives in an explicitly
+        # imported file (GitNexus three-tier confidence pattern).
+        imported_file_ids: dict[str, set[str]] = {}
+        for edge in snapshot.edges:
+            if edge.rel_type == RelType.IMPORTS and not edge.properties.get("is_external"):
+                imported_file_ids.setdefault(edge.source_id, set()).add(edge.target_id)
+
+        # Now link calls within each file using three-tier confidence:
+        #   Tier 1 — same-file symbol             → confidence 0.85
+        #   Tier 2 — symbol in an imported file   → confidence 0.90 (unique match only)
+        #   Tier 3 — unique global fuzzy match    → confidence 0.50
+        #   Ambiguous (multiple candidates)        → skip (noise reduction)
         for extraction in per_file_results:
             file_node = file_map.get(extraction.file_path)
             if file_node is None:
@@ -357,6 +369,7 @@ class GraphIndexingPipeline:
                 for sn in snapshot.symbol_nodes.values()
                 if sn.file_id == file_node.id
             }
+            this_imports = imported_file_ids.get(file_node.id, set())
 
             for raw_call in extraction.calls:
                 if not raw_call.callee_name:
@@ -369,12 +382,28 @@ class GraphIndexingPipeline:
                 if caller_sn is None:
                     continue
 
-                # Resolve callee: prefer local file, fall back to global
-                callee_sn = local_syms_by_name.get(raw_call.callee_name)
+                # Tier 1: same-file symbol
+                callee_sn: SymbolNode | None = local_syms_by_name.get(raw_call.callee_name)
+                confidence: float = 0.85
+
                 if callee_sn is None:
-                    candidates = global_name_index.get(raw_call.callee_name, [])
-                    # Pick the first candidate (ambiguous); could be refined with type info
-                    callee_sn = candidates[0] if candidates else None
+                    # Tier 2: symbol in an explicitly imported file
+                    all_candidates = global_name_index.get(raw_call.callee_name, [])
+                    imported_candidates = [c for c in all_candidates if c.file_id in this_imports]
+                    if len(imported_candidates) == 1:
+                        callee_sn = imported_candidates[0]
+                        confidence = 0.90
+                    elif len(imported_candidates) > 1:
+                        # Ambiguous across imported files — skip
+                        continue
+                    else:
+                        # Tier 3: unique global match
+                        if len(all_candidates) == 1:
+                            callee_sn = all_candidates[0]
+                            confidence = 0.50
+                        else:
+                            # Ambiguous globally — skip to avoid false edges
+                            continue
 
                 if callee_sn and callee_sn.id != caller_sn.id:
                     snapshot.edges.append(
@@ -383,6 +412,7 @@ class GraphIndexingPipeline:
                             caller_sn.id,
                             callee_sn.id,
                             line=raw_call.line,
+                            confidence=confidence,
                         )
                     )
 
@@ -397,6 +427,7 @@ class GraphIndexingPipeline:
                 for sn in snapshot.symbol_nodes.values()
                 if sn.file_id == file_node.id
             }
+            this_imports = imported_file_ids.get(file_node.id, set())
 
             for raw_inh in extraction.inheritance:
                 class_sn = local_syms.get(raw_inh.class_name)
@@ -406,18 +437,20 @@ class GraphIndexingPipeline:
                     # Only add cross-file edges (intra-file already done above)
                     if base_name in local_syms:
                         continue
-                    candidates = global_name_index.get(base_name, [])
-                    if candidates:
-                        base_sn = candidates[0]
-                        # Check not already added
-                        snapshot.edges.append(
-                            GraphEdge.create(
-                                RelType.INHERITS_FROM,
-                                class_sn.id,
-                                base_sn.id,
-                                line=raw_inh.line,
-                            )
+                    all_candidates = global_name_index.get(base_name, [])
+                    if not all_candidates:
+                        continue
+                    # Prefer the candidate in an explicitly imported file
+                    imported_candidates = [c for c in all_candidates if c.file_id in this_imports]
+                    base_sn = imported_candidates[0] if imported_candidates else all_candidates[0]
+                    snapshot.edges.append(
+                        GraphEdge.create(
+                            RelType.INHERITS_FROM,
+                            class_sn.id,
+                            base_sn.id,
+                            line=raw_inh.line,
                         )
+                    )
 
         return snapshot
 
