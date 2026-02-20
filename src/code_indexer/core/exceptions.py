@@ -133,6 +133,31 @@ class PathNotFoundError(IndexerError):
 
 
 # ---------------------------------------------------------------------------
+# Graph errors
+# ---------------------------------------------------------------------------
+
+
+class GraphError(CodeIndexerError):
+    """Raised when a graph store operation fails."""
+
+
+class GraphStoreConnectionError(GraphError):
+    """Raised when the graph store cannot be reached."""
+
+    http_status: int = 503
+
+
+class SymbolNotFoundError(GraphError):
+    """Raised when a requested symbol does not exist in the graph."""
+
+    http_status: int = 404
+
+    def __init__(self, symbol_id: str) -> None:
+        super().__init__(f"Symbol not found: {symbol_id!r}")
+        self.symbol_id = symbol_id
+
+
+# ---------------------------------------------------------------------------
 # API / auth errors
 # ---------------------------------------------------------------------------
 

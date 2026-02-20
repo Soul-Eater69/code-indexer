@@ -359,5 +359,185 @@ def serve_command(
     )
 
 
+# ---------------------------------------------------------------------------
+# graph commands
+# ---------------------------------------------------------------------------
+
+
+@cli.group("graph")
+def graph_group() -> None:
+    """Code knowledge graph commands (structural relationships)."""
+
+
+@graph_group.command("index")
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True))
+@click.option("--clear", is_flag=True, default=False, help="Wipe existing graph first.")
+@click.option("--provider", default=None, help="Graph store provider (in_memory/neo4j).")
+def graph_index_command(path: str, clear: bool, provider: str | None) -> None:
+    """Index the code knowledge graph for a directory.
+
+    This builds the structural graph (symbols, imports, call graph, inheritance)
+    separately from the vector index.
+
+    Examples::
+
+        code-indexer graph index ./my-project
+        code-indexer graph index ./my-project --clear --provider neo4j
+    """
+    from code_indexer.core.config import get_settings  # noqa: PLC0415
+    from code_indexer.graph.pipeline import GraphIndexingPipeline, build_graph_store  # noqa: PLC0415
+
+    settings = get_settings()
+    if provider:
+        settings.graph.provider = provider  # type: ignore[assignment]
+
+    console.print(Panel(f"[bold]Graph Indexing:[/bold] {path}", style="green"))
+
+    with console.status("Building code knowledge graph …"):
+        graph_store = build_graph_store(settings)
+        pipeline = GraphIndexingPipeline(settings=settings, graph_store=graph_store)
+        result = pipeline.index_directory(path, clear_existing=clear)
+
+    table = Table(title="Graph Indexing Summary", show_header=True)
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+    table.add_row("Files processed", str(result.files_processed))
+    table.add_row("Files skipped", str(result.files_skipped))
+    table.add_row("Symbols created", str(result.symbols_created))
+    table.add_row("Edges created", str(result.edges_created))
+    table.add_row("Elapsed", f"{result.elapsed_seconds:.1f}s")
+    table.add_row("Errors", str(len(result.errors)))
+    console.print(table)
+
+
+@graph_group.command("callers")
+@click.argument("symbol_name")
+@click.option("--depth", default=1, show_default=True, help="Traversal depth.")
+@click.option("--json-output", is_flag=True, default=False)
+def graph_callers_command(symbol_name: str, depth: int, json_output: bool) -> None:
+    """Show what calls SYMBOL_NAME in the codebase."""
+    from code_indexer.core.config import get_settings  # noqa: PLC0415
+    from code_indexer.graph.pipeline import GraphIndexingPipeline, build_graph_store  # noqa: PLC0415
+
+    settings = get_settings()
+    store = build_graph_store(settings)
+    syms = store.find_symbols_by_name(symbol_name)
+
+    if not syms:
+        console.print(f"[red]Symbol {symbol_name!r} not found in graph.[/red]")
+        sys.exit(1)
+
+    callers = store.get_callers(syms[0].id, depth=depth)
+
+    if json_output:
+        click.echo(json.dumps([c.model_dump() for c in callers], indent=2))
+        return
+
+    console.print(f"\n[bold]Callers of '{symbol_name}':[/bold]\n")
+    for c in callers:
+        console.print(f"  [green]{c.file_path}[/green]:{c.start_line}  [cyan]{c.qualified_name}[/cyan]  [{c.kind.value}]")
+
+
+@graph_group.command("callees")
+@click.argument("symbol_name")
+@click.option("--depth", default=1, show_default=True, help="Traversal depth.")
+@click.option("--json-output", is_flag=True, default=False)
+def graph_callees_command(symbol_name: str, depth: int, json_output: bool) -> None:
+    """Show what SYMBOL_NAME calls in the codebase."""
+    from code_indexer.core.config import get_settings  # noqa: PLC0415
+    from code_indexer.graph.pipeline import GraphIndexingPipeline, build_graph_store  # noqa: PLC0415
+
+    settings = get_settings()
+    store = build_graph_store(settings)
+    syms = store.find_symbols_by_name(symbol_name)
+
+    if not syms:
+        console.print(f"[red]Symbol {symbol_name!r} not found in graph.[/red]")
+        sys.exit(1)
+
+    callees = store.get_callees(syms[0].id, depth=depth)
+
+    if json_output:
+        click.echo(json.dumps([c.model_dump() for c in callees], indent=2))
+        return
+
+    console.print(f"\n[bold]'{symbol_name}' calls:[/bold]\n")
+    for c in callees:
+        console.print(f"  [green]{c.file_path}[/green]:{c.start_line}  [cyan]{c.qualified_name}[/cyan]  [{c.kind.value}]")
+
+
+@graph_group.command("context")
+@click.argument("symbol_name")
+@click.option("--json-output", is_flag=True, default=False)
+def graph_context_command(symbol_name: str, json_output: bool) -> None:
+    """Show full structural context for SYMBOL_NAME (for RAG).
+
+    Prints callers, callees, parent class, inheritance chain, and imports.
+    """
+    from code_indexer.core.config import get_settings  # noqa: PLC0415
+    from code_indexer.graph.pipeline import build_graph_store  # noqa: PLC0415
+
+    settings = get_settings()
+    store = build_graph_store(settings)
+    syms = store.find_symbols_by_name(symbol_name)
+
+    if not syms:
+        console.print(f"[red]Symbol {symbol_name!r} not found in graph.[/red]")
+        sys.exit(1)
+
+    ctx = store.get_symbol_context(syms[0].id)
+    if ctx is None:
+        console.print(f"[red]No context found for {symbol_name!r}.[/red]")
+        sys.exit(1)
+
+    if json_output:
+        click.echo(ctx.model_dump_json(indent=2))
+        return
+
+    console.print(Panel(ctx.to_context_text(), title=f"Context: {symbol_name}", style="cyan"))
+
+
+@graph_group.command("stats")
+@click.option("--json-output", is_flag=True, default=False)
+def graph_stats_command(json_output: bool) -> None:
+    """Show code knowledge graph statistics."""
+    from code_indexer.core.config import get_settings  # noqa: PLC0415
+    from code_indexer.graph.pipeline import build_graph_store  # noqa: PLC0415
+
+    settings = get_settings()
+    store = build_graph_store(settings)
+    stats = store.get_stats()
+
+    if json_output:
+        click.echo(stats.model_dump_json(indent=2))
+        return
+
+    table = Table(title="Graph Statistics", show_header=True)
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+    table.add_row("Files", str(stats.total_files))
+    table.add_row("Symbols", str(stats.total_symbols))
+    table.add_row("Directories", str(stats.total_directories))
+    table.add_row("Edges", str(stats.total_edges))
+    table.add_row("Graph store", stats.graph_store)
+    console.print(table)
+
+    if stats.edges_by_type:
+        edge_table = Table(title="Edges by Type")
+        edge_table.add_column("Type")
+        edge_table.add_column("Count", justify="right")
+        for rel_type, count in sorted(stats.edges_by_type.items(), key=lambda x: -x[1]):
+            edge_table.add_row(rel_type, str(count))
+        console.print(edge_table)
+
+    if stats.symbols_by_kind:
+        kind_table = Table(title="Symbols by Kind")
+        kind_table.add_column("Kind")
+        kind_table.add_column("Count", justify="right")
+        for kind, count in sorted(stats.symbols_by_kind.items(), key=lambda x: -x[1]):
+            kind_table.add_row(kind, str(count))
+        console.print(kind_table)
+
+
 if __name__ == "__main__":
     cli()

@@ -35,7 +35,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from code_indexer.api.middleware import APIKeyMiddleware, RequestLoggingMiddleware
 from code_indexer.api.routes import health, index, search
+from code_indexer.api.routes import graph as graph_routes
 from code_indexer.core.config import get_settings
+from code_indexer.graph.pipeline import GraphIndexingPipeline, build_graph_store
 from code_indexer.indexer.pipeline import (
     IndexingPipeline,
     build_embedder,
@@ -74,11 +76,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         vector_store=vector_store,
     )
 
+    # Build graph pipeline (optional — only if enabled in settings).
+    graph_pipeline = None
+    if settings.graph.enabled:
+        graph_store = build_graph_store(settings)
+        graph_pipeline = GraphIndexingPipeline(
+            settings=settings,
+            graph_store=graph_store,
+        )
+        logger.info("Graph pipeline initialised (provider=%s)", settings.graph.provider)
+
     # Attach to app state for dependency injection.
     app.state.settings = settings
     app.state.pipeline = pipeline
     app.state.embedder = embedder
     app.state.vector_store = vector_store
+    app.state.graph_pipeline = graph_pipeline
 
     logger.info("code-indexer started successfully")
     yield  # hand control to the application
@@ -138,6 +151,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router, tags=["health"])
     app.include_router(index.router, prefix="/index", tags=["indexing"])
     app.include_router(search.router, prefix="/search", tags=["search"])
+    app.include_router(graph_routes.router, prefix="/graph", tags=["graph"])
 
     # ---------------------------------------------------------------------------
     # Global exception handlers

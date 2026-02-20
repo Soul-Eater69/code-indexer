@@ -70,9 +70,16 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "pre-commit>=3.7",
+    "networkx>=3.3",        # for InMemoryGraphStore tests
 ]
 ollama = [
     "ollama>=0.2",
+]
+graph = [
+    # In-memory graph (zero infrastructure)
+    "networkx>=3.3",
+    # Production graph database
+    "neo4j>=5.20",
 ]
 
 [project.scripts]

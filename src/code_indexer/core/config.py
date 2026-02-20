@@ -159,6 +159,28 @@ class VectorStoreSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VECTORSTORE_", env_file=".env", extra="ignore")
 
 
+class GraphSettings(BaseSettings):
+    """Settings for the code knowledge graph layer.
+
+    Attributes:
+        enabled:       Whether to build the graph index alongside the vector index.
+        provider:      Graph store backend.
+        neo4j_uri:     Bolt URI for Neo4j (only used when provider="neo4j").
+        neo4j_username: Neo4j username.
+        neo4j_password: Neo4j password.
+        neo4j_database: Neo4j database name.
+    """
+
+    enabled: bool = False
+    provider: Literal["in_memory", "neo4j"] = "in_memory"
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_username: str = "neo4j"
+    neo4j_password: str = "password"
+    neo4j_database: str = "neo4j"
+
+    model_config = SettingsConfigDict(env_prefix="GRAPH_", env_file=".env", extra="ignore")
+
+
 class APISettings(BaseSettings):
     """Settings for the FastAPI server.
 
@@ -212,6 +234,7 @@ class Settings(BaseSettings):
     chunker: ChunkerSettings = Field(default_factory=ChunkerSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     vectorstore: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
+    graph: GraphSettings = Field(default_factory=GraphSettings)
     api: APISettings = Field(default_factory=APISettings)
 
     # Global toggles
