@@ -125,6 +125,36 @@ class CodeRetriever:
         )
 
     # ------------------------------------------------------------------
+    # Public helpers for hybrid retrieval
+    # ------------------------------------------------------------------
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed ``text`` using the configured embedder and return the vector.
+
+        Exposes the embedding step as a public method so callers such as
+        :class:`~code_indexer.retrieval.hybrid_retriever.HybridRetriever`
+        can obtain the query vector without accessing private attributes.
+        """
+        return self._embedder.embed_texts([text])[0]
+
+    def search_by_vector(
+        self,
+        query_vector: list[float],
+        top_k: int,
+        filters: dict | None = None,
+    ) -> list[SearchResult]:
+        """Query the vector store with a pre-computed ``query_vector``.
+
+        Skips the embedding step.  Used by the hybrid retriever to run
+        graph-expansion queries without re-embedding the original query.
+        """
+        return self._vector_store.query(
+            query_vector=query_vector,
+            top_k=top_k,
+            filters=filters or None,
+        )
+
+    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 

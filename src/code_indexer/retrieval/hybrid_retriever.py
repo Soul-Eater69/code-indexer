@@ -111,19 +111,23 @@ class HybridRetriever:
 
         Steps:
 
-        1. Run vector search for ``top_k * 2`` candidates.
-        2. For each result, expand via graph (callers, callees, parent class).
-        3. De-duplicate and re-score.
-        4. Return the top ``top_k`` results.
+        1. Embed the query once (shared by vector search and graph expansion).
+        2. Run vector search for ``top_k * 2`` candidates.
+        3. For each result, expand via graph (callers, callees, parent class).
+        4. Merge with RRF and return the top ``top_k`` results.
         """
         t0 = time.perf_counter()
+
+        # Embed once — the same vector is reused for graph expansion queries,
+        # avoiding a second embedder round-trip per related symbol lookup.
+        query_vector = self._vector_retriever.embed_query(query.query)
 
         # --- Stage 1: vector search ---
         vector_query = query.model_copy(update={"top_k": query.top_k * 2})
         vector_response = self._vector_retriever.search(vector_query)
 
         # --- Stage 2: graph expansion ---
-        expanded = self._expand_with_graph(vector_response.results, query)
+        expanded = self._expand_with_graph(vector_response.results, query, query_vector)
 
         # --- Stage 3: de-duplicate and re-rank ---
         final = self._merge_and_rank(vector_response.results, expanded, query.top_k)
@@ -158,8 +162,21 @@ class HybridRetriever:
         self,
         vector_results: list[SearchResult],
         query: SearchQuery,
+        query_vector: list[float],
     ) -> list[SearchResult]:
-        """Expand each vector result by fetching related symbols from the graph."""
+        """Expand each vector result by fetching related symbols from the graph.
+
+        Parameters
+        ----------
+        vector_results:
+            Results from the vector search stage.
+        query:
+            Original search query (used for ``top_k`` and filters).
+        query_vector:
+            Pre-computed query embedding.  Passed explicitly rather than
+            being read from a private attribute — eliminates the fragile
+            ``_last_query_vector`` access that previously existed here.
+        """
         extra: list[SearchResult] = []
         seen_chunk_ids: set[str] = {r.chunk.id for r in vector_results}
 
@@ -186,17 +203,17 @@ class HybridRetriever:
             related_symbols.extend(ctx.methods[: self._max_expansions])
             related_symbols.extend(ctx.inherits_from)
 
-            # For each related symbol, try to fetch its chunk from the vector store
+            # For each related symbol, fetch its chunk from the vector store
+            # using the public search_by_vector API (no private attribute access).
             expansions_added = 0
             for rel_sym in related_symbols:
                 if expansions_added >= self._max_expansions:
                     break
-                # Fetch chunks that match this symbol's file + name
-                related_chunks = self._vector_retriever._vector_store.query(
-                    query_vector=self._vector_retriever._last_query_vector or [],
+                related_chunks = self._vector_retriever.search_by_vector(
+                    query_vector=query_vector,
                     top_k=3,
                     filters={"path": rel_sym.file_path, "name": rel_sym.name},
-                ) if hasattr(self._vector_retriever, "_last_query_vector") else []
+                )
 
                 for related_result in related_chunks:
                     if related_result.chunk.id in seen_chunk_ids:

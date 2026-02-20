@@ -17,7 +17,9 @@ For production use, switch to
 
 from __future__ import annotations
 
+import json
 import logging
+import pathlib
 from collections import deque
 from typing import Any
 
@@ -358,6 +360,104 @@ class InMemoryGraphStore(BaseGraphStore):
             languages=languages,
             graph_store=self.name,
         )
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Serialise the graph to a JSON file at ``path``.
+
+        The file can be reloaded with :meth:`load` to restore the graph
+        across process restarts — solving the in-memory store's biggest
+        limitation for development use.
+
+        File format: plain JSON produced by Pydantic's ``model_dump``.
+        All node and edge data is included; secondary indexes are
+        rebuilt automatically on load.
+        """
+        snap = self._to_snapshot()
+        data = {
+            "file_nodes": {k: v.model_dump(mode="json") for k, v in snap.file_nodes.items()},
+            "symbol_nodes": {k: v.model_dump(mode="json") for k, v in snap.symbol_nodes.items()},
+            "directory_nodes": {
+                k: v.model_dump(mode="json") for k, v in snap.directory_nodes.items()
+            },
+            "edges": [e.model_dump(mode="json") for e in snap.edges],
+        }
+        pathlib.Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.info(
+            "Graph saved to %s (%d files, %d symbols, %d edges)",
+            path,
+            len(snap.file_nodes),
+            len(snap.symbol_nodes),
+            len(snap.edges),
+        )
+
+    @classmethod
+    def load(cls, path: str, *, use_networkx: bool = True) -> "InMemoryGraphStore":
+        """Restore a previously :meth:`save`-d graph from ``path``.
+
+        Returns a fully initialised :class:`InMemoryGraphStore` with all
+        secondary indexes rebuilt.
+
+        Example::
+
+            store = InMemoryGraphStore.load(".cache/graph.json")
+        """
+        raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        snap = GraphSnapshot(
+            file_nodes={k: FileNode.model_validate(v) for k, v in raw["file_nodes"].items()},
+            symbol_nodes={
+                k: SymbolNode.model_validate(v) for k, v in raw["symbol_nodes"].items()
+            },
+            directory_nodes={
+                k: DirectoryNode.model_validate(v) for k, v in raw["directory_nodes"].items()
+            },
+            edges=[GraphEdge.model_validate(e) for e in raw["edges"]],
+        )
+        store = cls(use_networkx=use_networkx)
+        store.upsert(snap)
+        logger.info(
+            "Graph loaded from %s (%d files, %d symbols, %d edges)",
+            path,
+            len(snap.file_nodes),
+            len(snap.symbol_nodes),
+            len(snap.edges),
+        )
+        return store
+
+    def _to_snapshot(self) -> GraphSnapshot:
+        """Reconstruct a :class:`GraphSnapshot` from the current graph state."""
+        snap = GraphSnapshot()
+
+        if self._using_nx:
+            for nid, attrs in self._g.nodes(data=True):
+                data = attrs.get("data")
+                if isinstance(data, FileNode):
+                    snap.file_nodes[nid] = data
+                elif isinstance(data, SymbolNode):
+                    snap.symbol_nodes[nid] = data
+                elif isinstance(data, DirectoryNode):
+                    snap.directory_nodes[nid] = data
+            for _src, _tgt, attrs in self._g.edges(data=True):
+                if "edge" in attrs:
+                    snap.edges.append(attrs["edge"])
+        else:
+            for nid, attrs in self._g.nodes().items():
+                data = attrs.get("data")
+                if isinstance(data, FileNode):
+                    snap.file_nodes[nid] = data
+                elif isinstance(data, SymbolNode):
+                    snap.symbol_nodes[nid] = data
+                elif isinstance(data, DirectoryNode):
+                    snap.directory_nodes[nid] = data
+            for edge_list in self._g._out.values():
+                for ed in edge_list:
+                    if "edge" in ed:
+                        snap.edges.append(ed["edge"])
+
+        return snap
 
     @property
     def name(self) -> str:

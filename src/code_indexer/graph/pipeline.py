@@ -31,6 +31,7 @@ Usage::
 
 from __future__ import annotations
 
+import bisect
 import logging
 import posixpath
 import time
@@ -345,6 +346,11 @@ class GraphIndexingPipeline:
         for sn in snapshot.symbol_nodes.values():
             global_name_index.setdefault(sn.name, []).append(sn)
 
+        # Pre-build per-file symbol index sorted by start_line.
+        # Reduces _find_enclosing_symbol from O(total_symbols) per call
+        # to O(k·log n) where k is the number of symbols in one file.
+        file_symbol_index = self._build_file_symbol_index(snapshot)
+
         # Build per-file import target set from edges already assembled.
         # Used to boost confidence when the callee lives in an explicitly
         # imported file (GitNexus three-tier confidence pattern).
@@ -377,7 +383,7 @@ class GraphIndexingPipeline:
 
                 # Find caller: a function that contains this line number
                 caller_sn = self._find_enclosing_symbol(
-                    raw_call.line, file_node.id, snapshot
+                    raw_call.line, file_node.id, file_symbol_index
                 )
                 if caller_sn is None:
                     continue
@@ -455,18 +461,50 @@ class GraphIndexingPipeline:
         return snapshot
 
     @staticmethod
+    def _build_file_symbol_index(
+        snapshot: GraphSnapshot,
+    ) -> dict[str, list[SymbolNode]]:
+        """Build a per-file index of symbols sorted by ``start_line``.
+
+        Called once before the call-resolution pass.  Reduces the repeated
+        full-snapshot scan in :meth:`_find_enclosing_symbol` from
+        O(total_symbols × calls) to a single O(total_symbols) build,
+        after which each lookup is O(k + log n) where k is the number of
+        symbols in the file that start before the target line.
+        """
+        index: dict[str, list[SymbolNode]] = {}
+        for sn in snapshot.symbol_nodes.values():
+            index.setdefault(sn.file_id, []).append(sn)
+        for syms in index.values():
+            syms.sort(key=lambda s: s.start_line)
+        return index
+
+    @staticmethod
     def _find_enclosing_symbol(
-        line: int, file_id: str, snapshot: GraphSnapshot
+        line: int,
+        file_id: str,
+        file_symbol_index: dict[str, list[SymbolNode]],
     ) -> SymbolNode | None:
-        """Find the smallest symbol in ``file_id`` that contains ``line``."""
+        """Find the smallest symbol in ``file_id`` that contains ``line``.
+
+        Uses binary search on the pre-sorted per-file index so the hot
+        inner loop (one call per RawCall) is O(log n) rather than O(n).
+        """
+        syms = file_symbol_index.get(file_id, [])
+        if not syms:
+            return None
+
+        # Binary search: find the right boundary where start_line > line.
+        # All symbols at indices [:idx] have start_line <= line.
+        start_lines = [s.start_line for s in syms]
+        idx = bisect.bisect_right(start_lines, line)
+
         best: SymbolNode | None = None
         best_size = float("inf")
-        for sn in snapshot.symbol_nodes.values():
-            if sn.file_id != file_id:
-                continue
-            if sn.start_line <= line <= sn.end_line:
-                size = sn.end_line - sn.start_line
+        for s in syms[:idx]:
+            if s.end_line >= line:
+                size = s.end_line - s.start_line
                 if size < best_size:
-                    best = sn
+                    best = s
                     best_size = size
         return best

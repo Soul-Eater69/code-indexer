@@ -135,6 +135,18 @@ class BaseGraphStore(ABC):
         """Return summary statistics about the current graph."""
 
     # ------------------------------------------------------------------
+    # Persistence (optional — only in-memory stores need this)
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Serialise the graph to disk at ``path``.
+
+        Default implementation raises :exc:`NotImplementedError`.
+        Override in stores that support on-disk persistence.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support save()")
+
+    # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
 
