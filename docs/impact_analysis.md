@@ -461,8 +461,11 @@ language server) and correctness (confidence-weighted BFS, ambiguity pruning).
 | ✅ Done | `INJECTS` edges (constructor / field DI) |
 | ✅ Done | `decorators` field on `SymbolNode` |
 | ✅ Done | `to_mermaid()` on `SymbolContext` and `ImpactResult` |
+| ✅ Done | `GraphSnapshot.compute_katz_centrality()` — structural hotspot ranking |
+| ✅ Done | `ContextPacker` — knapsack-optimal context window selection |
 | Next | `get_injectors(symbol_id)` API endpoint |
 | Next | Multi-hop Cypher in `Neo4jGraphStore` (push BFS into Cypher) |
+| Next | Entrypoint-based traversal: expand from focal symbol outward until budget hit |
 | Future | Language-server integration (pyright / rust-analyzer) for tier-3 replacement |
 | Future | Deep inheritance traversal (transitive subclass chains) |
 | Future | Transitive reverse imports (BFS over reversed `IMPORTS`) |

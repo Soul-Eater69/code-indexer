@@ -250,6 +250,102 @@ class GraphSnapshot(BaseModel):
     def edges_of_type(self, rel_type: RelType) -> list[GraphEdge]:
         return [e for e in self.edges if e.rel_type == rel_type]
 
+    def compute_katz_centrality(
+        self,
+        alpha: float = 0.1,
+        beta: float = 1.0,
+        max_iter: int = 100,
+        tol: float = 1e-6,
+        edge_types: frozenset | None = None,
+    ) -> dict[str, float]:
+        """Compute Katz centrality for all symbol nodes in the snapshot.
+
+        Katz centrality assigns higher scores to symbols that are
+        transitively depended upon by many others — the architectural
+        **hotspots** of the codebase.  It is the graph-theoretic analogue
+        of ``entity_rank`` from the ``code-chopper`` library.
+
+        The score for node ``v`` is:
+
+        .. math::
+
+            k_v = \\alpha \\sum_u A_{uv} \\, k_u + \\beta
+
+        where :math:`A` is the adjacency matrix of the selected edge types
+        (structural dependence direction: ``u → v`` means ``u`` depends on
+        ``v``, so ``v`` gains centrality).  The iterative power-method
+        converges in O(max_iter × |E|) time with no external dependencies.
+
+        Parameters
+        ----------
+        alpha:
+            Attenuation factor.  Must be less than ``1 / λ_max`` of the
+            adjacency matrix.  The default of ``0.1`` is safe for
+            typical code graphs.  Increase toward ``0.3`` for larger
+            repos where you want multi-hop influence to propagate further.
+        beta:
+            Baseline score added at every iteration (default ``1.0``).
+            Symbols with no incoming edges receive exactly ``beta`` in the
+            first iteration.
+        max_iter:
+            Maximum power-method iterations (default ``100``).
+        tol:
+            Convergence tolerance: stop when the total change in scores
+            across all nodes is less than ``tol × n`` (default ``1e-6``).
+        edge_types:
+            Set of :class:`RelType` values whose edges are included in the
+            adjacency matrix.  Defaults to
+            ``{CALLS, INJECTS, INHERITS_FROM}`` — the three structural
+            dependency types.
+
+        Returns
+        -------
+        dict[str, float]
+            ``{symbol_id: score}`` normalised to ``[0, 1]``.  Symbols
+            not in the snapshot return ``0.0`` when looked up.
+        """
+        if edge_types is None:
+            edge_types = frozenset(
+                {RelType.CALLS, RelType.INJECTS, RelType.INHERITS_FROM}
+            )
+
+        symbol_ids = list(self.symbol_nodes.keys())
+        if not symbol_ids:
+            return {}
+
+        idx_of: dict[str, int] = {sid: i for i, sid in enumerate(symbol_ids)}
+        n = len(symbol_ids)
+
+        # in_adj[v] = list of source indices u such that u→v exists.
+        # An edge u→v (u calls/injects/inherits v) means v gains centrality.
+        in_adj: list[list[int]] = [[] for _ in range(n)]
+        for edge in self.edges:
+            if edge.rel_type not in edge_types:
+                continue
+            src_idx = idx_of.get(edge.source_id)
+            tgt_idx = idx_of.get(edge.target_id)
+            if src_idx is not None and tgt_idx is not None:
+                in_adj[tgt_idx].append(src_idx)
+
+        # Power iteration: k^(t+1)[v] = alpha * sum_u k^(t)[u] + beta
+        k: list[float] = [beta] * n
+        for _ in range(max_iter):
+            k_new: list[float] = [beta] * n
+            for v in range(n):
+                for u in in_adj[v]:
+                    k_new[v] += alpha * k[u]
+            diff = sum(abs(k_new[i] - k[i]) for i in range(n))
+            k = k_new
+            if diff < tol * n:
+                break
+
+        # Normalise to [0, 1]
+        lo, hi = min(k), max(k)
+        span = hi - lo
+        if span < 1e-10:
+            return {sid: 1.0 for sid in symbol_ids}
+        return {symbol_ids[i]: (k[i] - lo) / span for i in range(n)}
+
 
 class SymbolContext(BaseModel):
     """Full structural context for a single symbol.
