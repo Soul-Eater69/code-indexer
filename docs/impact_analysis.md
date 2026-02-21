@@ -8,7 +8,7 @@ the question: **"If I change symbol X, what else could break?"**
 ## Overview
 
 Impact analysis runs as a graph traversal over the code knowledge graph built
-by `GraphIndexingPipeline`.  Three independent dimensions of impact are
+by `GraphIndexingPipeline`.  Four independent dimensions of impact are
 combined into a single `ImpactResult`:
 
 | Dimension | Graph edges traversed | Direction |
@@ -16,6 +16,7 @@ combined into a single `ImpactResult`:
 | Call-graph | `CALLS` | Reverse (incoming) |
 | Inheritance | `INHERITS_FROM` | Reverse (incoming) |
 | File imports | `IMPORTS` | Reverse (incoming) |
+| Dependency injection | `INJECTS` | Reverse (incoming) |
 
 ---
 
@@ -147,9 +148,206 @@ has no confidence issue — all entries are certain.
 
 ---
 
-## API
+## 4. Dependency-injection reverse (INJECTS edges)
 
-### `POST /graph/impact`
+### What it answers
+
+Which classes structurally depend on the changed class as a constructor
+argument or typed field — meaning they will receive a different object if the
+changed class is replaced, subclassed, or has its constructor signature altered?
+
+This is the **data-dependency graph**, complementary to the call graph.
+
+### Motivation
+
+Inspired by the DKB paper (arXiv:2601.08773) which showed that `extends` /
+`implements` / `injects` edges together produce 100% correct multi-hop
+architectural reasoning, versus 86.7% without them.
+
+### Approach
+
+**Extraction (index time)**
+
+Three per-language extractors detect dependency-injection patterns and produce
+`RawInjection(class_name, field_name, field_type, line)` records:
+
+| Language | Patterns detected |
+|----------|------------------|
+| Python | `__init__` typed parameters; class-body `field: Type` annotations |
+| TypeScript | Constructor parameters with `private`/`public`/`readonly` modifiers + type annotation |
+| Java | `@Autowired` / `@Inject` fields; `@Autowired` constructor params; `private final` fields in `@RequiredArgsConstructor` classes |
+
+Example — Python constructor injection:
+
+```python
+class OrderService:
+    def __init__(
+        self,
+        repo: OrderRepository,       # → INJECTS edge: OrderService → OrderRepository
+        notifier: EmailNotifier,     # → INJECTS edge: OrderService → EmailNotifier
+    ) -> None: ...
+```
+
+Example — Python field annotation:
+
+```python
+class PaymentService:
+    gateway: StripeGateway           # → INJECTS edge: PaymentService → StripeGateway
+    db: Optional[Database] = None   # → INJECTS edge: PaymentService → Database
+```
+
+Example — TypeScript NestJS / Angular:
+
+```typescript
+@Injectable()
+class OrderController {
+  constructor(
+    private readonly orderSvc: OrderService,   // → INJECTS edge
+    private mailer: MailerService,             // → INJECTS edge
+  ) {}
+}
+```
+
+Example — Java Spring:
+
+```java
+@Service
+class UserController {
+    @Autowired
+    private UserRepository userRepository;   // → INJECTS edge
+
+    @Autowired
+    public UserController(TokenValidator tv) { ... }  // → INJECTS edge
+}
+```
+
+**Resolution (index time)**
+
+For each `RawInjection`, the pipeline looks up `field_type` in the symbol
+index using the same priority order as calls:
+1. Candidate in an explicitly imported file → used directly.
+2. Unique global match → used (no confidence penalty for injections; they are
+   structurally explicit).
+3. Multiple ambiguous candidates → first class-kind match wins; ties are skipped.
+
+Each resolved pair becomes an `INJECTS` edge:
+
+```
+(:Symbol {class_name}) -[:INJECTS {field_name, field_type, line}]-> (:Symbol {field_type})
+```
+
+**Traversal (query time)**
+
+Currently `get_impact_set` surface injectors via the `INJECTS` edge set so
+that callers of the injected class's public API also appear in impact results.
+A dedicated `get_injectors(symbol_id)` query will be added in a future iteration
+to expose the injection graph directly through the API.
+
+### Cypher example (Neo4j backend)
+
+```cypher
+-- "What classes inject OrderRepository, and what do they call?"
+MATCH (dep:Symbol)-[:INJECTS]->(target:Symbol {name: "OrderRepository"})
+OPTIONAL MATCH (dep)-[:CALLS]->(downstream:Symbol)
+RETURN dep.qualified_name AS injector,
+       collect(downstream.name) AS downstream_calls
+ORDER BY injector
+```
+
+---
+
+## 5. Decorator / annotation filtering
+
+Symbols now carry a `decorators: list[str]` field populated at extraction time.
+This enables decorator-based filtering in both impact analysis and context
+retrieval — a feature pioneered in `vitali87/code-graph-rag`.
+
+```python
+# Find all route handlers (FastAPI / Flask)
+symbols = store.find_symbols_by_name("*")
+routes = [s for s in symbols if any(
+    d.startswith("router.") or d.startswith("app.") for d in s.decorators
+)]
+
+# Find all Celery tasks
+tasks = [s for s in symbols if "task" in s.decorators or "shared_task" in s.decorators]
+
+# Find all pytest fixtures
+fixtures = [s for s in symbols if "pytest.fixture" in s.decorators]
+```
+
+Decorator values are stripped of `@` and call arguments:
+- `@pytest.mark.skip(reason="not ready")` → `"pytest.mark.skip"`
+- `@router.get("/users")` → `"router.get"`
+- `@staticmethod` → `"staticmethod"`
+
+**Neo4j — filter by decorator:**
+
+```cypher
+MATCH (s:Symbol)
+WHERE 'pytest.fixture' IN s.decorators
+RETURN s.qualified_name, s.file_path
+```
+
+---
+
+## 6. Mermaid output
+
+Both `SymbolContext` and `ImpactResult` now expose a `to_mermaid()` method that
+renders a Mermaid flowchart suitable for injecting directly into LLM prompts.
+
+### `SymbolContext.to_mermaid()`
+
+Renders the call neighbourhood centred on the focal symbol:
+
+```python
+ctx = store.get_symbol_context(sym.id)
+print(ctx.to_mermaid())
+```
+
+```mermaid
+flowchart TD
+    _self["verify_token [method]"]
+    _caller_0["handle_request [function]"]
+    _caller_0 -->|calls| _self
+    _caller_1["middleware [function]"]
+    _caller_1 -->|calls| _self
+    _callee_0["decode_jwt [function]"]
+    _self -->|calls| _callee_0
+    _parent["JWTHandler [class]"]
+    _parent -->|contains| _self
+    _base_0["BaseHandler [class]"]
+    _self -->|inherits| _base_0
+```
+
+### `ImpactResult.to_mermaid()`
+
+Renders the blast radius with the changed symbol highlighted:
+
+```python
+impact = store.get_impact_set(sym.id, min_confidence=0.5)
+print(impact.to_mermaid())
+```
+
+```mermaid
+flowchart TD
+    _target["◆ verify_token [method]  ← CHANGED"]:::changed
+    _dc_0["handle_request [function]"]
+    _dc_0 -->|calls| _target
+    _tc_0["middleware [function]"]
+    _tc_0 -.->|transitive| _target
+    _sub_0["AdminHandler [class]"]
+    _sub_0 -->|inherits| _target
+    classDef changed fill:#f96,stroke:#c33,color:#000
+```
+
+The Mermaid output is particularly useful when constructing LLM prompts for
+code review, because it gives the model a compact structural summary without
+requiring it to read the raw source of every caller.
+
+---
+
+## API
 
 ```json
 {
@@ -236,17 +434,36 @@ for f in impact.affected_files:
 
 ---
 
+## Sources
+
+The design of INJECTS edges and decorator tracking was informed by two external
+sources:
+
+- **`vitali87/code-graph-rag`** — demonstrated 15 relation types including
+  `DEFINES_METHOD`, `OVERRIDES`, and `DEPENDS_ON_EXTERNAL`; introduced
+  decorator/annotation tracking on symbol nodes for query-time filtering.
+- **arXiv:2601.08773 "Reliable Graph-RAG for Codebases"** — showed that
+  deterministic AST-derived graphs with `extends`/`implements`/`injects` edges
+  achieve 100% correctness on multi-hop architectural reasoning queries vs 86.7%
+  for LLM-extracted graphs; introduced the `INJECTS` pattern for DI framework
+  analysis.
+
+---
+
 ## Accuracy roadmap
 
 The current implementation is a pragmatic balance of speed (tree-sitter, no
 language server) and correctness (confidence-weighted BFS, ambiguity pruning).
-For higher precision:
 
-1. **Language-server integration** — wire pyright / rust-analyzer to replace
-   tier-3 global name matching with type-resolved targets.
-2. **Deep inheritance traversal** — extend `get_impact_set` to follow
-   `INHERITS_FROM` edges transitively (multi-hop subclass chains).
-3. **Transitive reverse imports** — BFS over reversed `IMPORTS` edges to
-   surface files that are indirectly affected through import chains.
-4. **Signature-aware impact** — track which parameters/return types changed
-   to filter out callers that only use unaffected parts of the API.
+| Status | Enhancement |
+|--------|-------------|
+| ✅ Done | Three-tier confidence call resolution |
+| ✅ Done | `INJECTS` edges (constructor / field DI) |
+| ✅ Done | `decorators` field on `SymbolNode` |
+| ✅ Done | `to_mermaid()` on `SymbolContext` and `ImpactResult` |
+| Next | `get_injectors(symbol_id)` API endpoint |
+| Next | Multi-hop Cypher in `Neo4jGraphStore` (push BFS into Cypher) |
+| Future | Language-server integration (pyright / rust-analyzer) for tier-3 replacement |
+| Future | Deep inheritance traversal (transitive subclass chains) |
+| Future | Transitive reverse imports (BFS over reversed `IMPORTS`) |
+| Future | Signature-aware impact (filter by changed parameter/return types) |

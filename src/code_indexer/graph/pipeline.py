@@ -278,6 +278,7 @@ class GraphIndexingPipeline:
                     start_line=raw.start_line,
                     end_line=raw.end_line,
                     parent_name=raw.parent_name,
+                    decorators=raw.decorators,
                 )
                 snapshot.symbol_nodes[sn.id] = sn
                 local_symbols[raw.name] = sn
@@ -455,6 +456,61 @@ class GraphIndexingPipeline:
                             class_sn.id,
                             base_sn.id,
                             line=raw_inh.line,
+                        )
+                    )
+
+        # --- Injection resolution (INJECTS edges) ---
+        # Link class → dependency type via constructor/field type annotations.
+        # Resolution mirrors the call-graph tier system:
+        #   - Prefer a candidate in an explicitly imported file.
+        #   - Fall back to a unique global match.
+        #   - Skip when ambiguous (multiple unrelated candidates).
+        for extraction in per_file_results:
+            file_node = file_map.get(extraction.file_path)
+            if file_node is None or not extraction.injections:
+                continue
+
+            local_syms = {
+                sn.name: sn
+                for sn in snapshot.symbol_nodes.values()
+                if sn.file_id == file_node.id
+            }
+            this_imports = imported_file_ids.get(file_node.id, set())
+
+            for raw_inj in extraction.injections:
+                class_sn = local_syms.get(raw_inj.class_name)
+                if class_sn is None:
+                    continue
+
+                all_candidates = global_name_index.get(raw_inj.field_type, [])
+                if not all_candidates:
+                    continue
+
+                # Prefer a candidate in an explicitly imported file
+                imported_candidates = [c for c in all_candidates if c.file_id in this_imports]
+                if len(imported_candidates) == 1:
+                    target_sn = imported_candidates[0]
+                elif len(imported_candidates) > 1:
+                    # Ambiguous across imported files — take the first class match
+                    target_sn = next(
+                        (c for c in imported_candidates if c.kind.value == "class"),
+                        imported_candidates[0],
+                    )
+                elif len(all_candidates) == 1:
+                    target_sn = all_candidates[0]
+                else:
+                    # Ambiguous globally — skip
+                    continue
+
+                if target_sn.id != class_sn.id:
+                    snapshot.edges.append(
+                        GraphEdge.create(
+                            RelType.INJECTS,
+                            class_sn.id,
+                            target_sn.id,
+                            field_name=raw_inj.field_name or "",
+                            field_type=raw_inj.field_type,
+                            line=raw_inj.line,
                         )
                     )
 

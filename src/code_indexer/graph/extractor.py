@@ -40,6 +40,7 @@ from code_indexer.graph.models import (
     RawCall,
     RawImport,
     RawInheritance,
+    RawInjection,
     RawSymbol,
     SymbolKind,
 )
@@ -484,16 +485,21 @@ def _python_extract_calls(root: Any, src: bytes) -> list[RawCall]:
 
 def _python_extract_symbols(root: Any, src: bytes) -> list[RawSymbol]:
     symbols: list[RawSymbol] = []
-    _KIND_MAP = {
-        "function_definition": SymbolKind.FUNCTION,
-        "async_function_def": SymbolKind.FUNCTION,
-        "decorated_definition": SymbolKind.FUNCTION,
-        "class_definition": SymbolKind.CLASS,
-    }
     # Track current class scope for methods
     class_stack: list[str] = []
 
-    def _walk(node: Any, depth: int) -> None:
+    def _collect_decorators(decorated_node: Any) -> list[str]:
+        """Extract decorator names from a ``decorated_definition`` node."""
+        decs: list[str] = []
+        for child in decorated_node.children:
+            if child.type == "decorator":
+                # Full decorator text minus the leading "@"
+                raw = _node_text(child, src).lstrip("@").strip()
+                # Drop call arguments: "pytest.mark.skip(reason=...)" → "pytest.mark.skip"
+                decs.append(raw.split("(")[0].strip())
+        return decs
+
+    def _walk(node: Any, depth: int, pending_decorators: list[str] | None = None) -> None:
         if node.type in ("function_definition", "async_function_def"):
             name_node = _child_of_type(node, "identifier")
             name = _node_text(name_node, src) if name_node else "<unknown>"
@@ -505,6 +511,7 @@ def _python_extract_symbols(root: Any, src: bytes) -> list[RawSymbol]:
                     start_line=_start_line(node),
                     end_line=_end_line(node),
                     parent_name=class_stack[-1] if class_stack else None,
+                    decorators=pending_decorators or [],
                 )
             )
             # Don't descend into nested function bodies for the class_stack
@@ -518,6 +525,7 @@ def _python_extract_symbols(root: Any, src: bytes) -> list[RawSymbol]:
                     start_line=_start_line(node),
                     end_line=_end_line(node),
                     parent_name=class_stack[-1] if class_stack else None,
+                    decorators=pending_decorators or [],
                 )
             )
             class_stack.append(name)
@@ -526,10 +534,11 @@ def _python_extract_symbols(root: Any, src: bytes) -> list[RawSymbol]:
             class_stack.pop()
             return
         elif node.type == "decorated_definition":
-            # Forward to the inner definition
+            # Collect decorators then forward to the inner definition
+            decs = _collect_decorators(node)
             inner = _child_of_type(node, "function_definition", "class_definition")
             if inner:
-                _walk(inner, depth)
+                _walk(inner, depth, decs)
             return
 
         for child in node.children:
@@ -562,6 +571,111 @@ def _python_extract_inheritance(root: Any, src: bytes) -> list[RawInheritance]:
                     )
                 )
     return result
+
+
+def _python_extract_injections(root: Any, src: bytes) -> list[RawInjection]:
+    """Extract DI edges from Python classes.
+
+    Detects two patterns:
+
+    1. **Constructor injection** — typed parameters in ``__init__`` (excluding
+       ``self``) whose type name starts with an uppercase letter.
+    2. **Field annotation** — class-body ``annotated_assignment`` nodes whose
+       type annotation starts with an uppercase letter.
+
+    Generic containers (``Optional``, ``List``, ``Dict``, …) are unwrapped so
+    that ``repo: Optional[UserRepository]`` produces ``field_type="UserRepository"``.
+    """
+    _GENERIC_WRAPPERS = frozenset(
+        {"Optional", "List", "Dict", "Set", "Tuple", "Union", "ClassVar", "Final"}
+    )
+    injections: list[RawInjection] = []
+
+    def _extract_type_name(type_node: Any) -> str | None:
+        """Return the first uppercase-starting type name from a type annotation node."""
+        text = _node_text(type_node, src).strip()
+        # Unwrap generics: Optional[Foo] → Foo, List[Bar] → Bar
+        if "[" in text:
+            inner = text[text.index("[") + 1 : text.rindex("]")].split(",")[0].strip()
+            base = text.split("[")[0].strip()
+            if base in _GENERIC_WRAPPERS:
+                text = inner
+        # Union: Foo | None → Foo
+        text = text.split("|")[0].strip()
+        return text if text and text[0].isupper() else None
+
+    for class_node in _iter_nodes(root):
+        if class_node.type != "class_definition":
+            continue
+        name_node = _child_of_type(class_node, "identifier")
+        if name_node is None:
+            continue
+        class_name = _node_text(name_node, src)
+
+        body = _child_of_type(class_node, "block")
+        if body is None:
+            continue
+
+        for child in body.children:
+            # --- Pattern 1: class-level annotated_assignment ---
+            if child.type == "annotated_assignment":
+                # Tree-sitter layout: (annotated_assignment lhs ":" type ["=" value])
+                named_children = [c for c in child.children if c.is_named]
+                if len(named_children) >= 2:
+                    field_node = named_children[0]
+                    type_node = named_children[1]
+                    type_name = _extract_type_name(type_node)
+                    if type_name:
+                        injections.append(
+                            RawInjection(
+                                class_name=class_name,
+                                field_name=_node_text(field_node, src),
+                                field_type=type_name,
+                                line=_start_line(child),
+                            )
+                        )
+                continue
+
+            # --- Pattern 2: __init__ constructor typed parameters ---
+            fn_node = None
+            if child.type in ("function_definition", "async_function_def"):
+                fn_node = child
+            elif child.type == "decorated_definition":
+                fn_node = _child_of_type(child, "function_definition", "async_function_def")
+
+            if fn_node is None:
+                continue
+            fn_name_node = _child_of_type(fn_node, "identifier")
+            if fn_name_node is None or _node_text(fn_name_node, src) != "__init__":
+                continue
+
+            params = _child_of_type(fn_node, "parameters")
+            if params is None:
+                continue
+
+            for param in params.children:
+                if param.type != "typed_parameter":
+                    continue
+                named = [c for c in param.children if c.is_named]
+                if not named:
+                    continue
+                param_name = _node_text(named[0], src)
+                if param_name in ("self", "cls"):
+                    continue
+                # Type annotation is the second named child
+                if len(named) >= 2:
+                    type_name = _extract_type_name(named[1])
+                    if type_name:
+                        injections.append(
+                            RawInjection(
+                                class_name=class_name,
+                                field_name=param_name,
+                                field_type=type_name,
+                                line=_start_line(param),
+                            )
+                        )
+
+    return injections
 
 
 # --- JAVASCRIPT / TYPESCRIPT ------------------------------------------------
@@ -788,6 +902,87 @@ def _js_extract_inheritance(root: Any, src: bytes) -> list[RawInheritance]:
                     )
                 )
     return result
+
+
+def _js_extract_injections(root: Any, src: bytes) -> list[RawInjection]:
+    """Extract TypeScript constructor-parameter injection edges.
+
+    Detects the Angular / NestJS / InversifyJS pattern where constructor
+    parameters carry an access modifier (``private``, ``public``, ``readonly``)
+    and a type annotation — indicating that the framework will inject the
+    dependency at runtime.
+
+    Example::
+
+        class OrderService {
+          constructor(
+            private readonly repo: OrderRepository,
+            private mailer: MailService,
+          ) {}
+        }
+    """
+    injections: list[RawInjection] = []
+
+    for class_node in _iter_nodes(root):
+        if class_node.type not in ("class_declaration", "class"):
+            continue
+        name_node = _child_of_type(class_node, "identifier", "type_identifier")
+        if name_node is None:
+            continue
+        class_name = _node_text(name_node, src)
+
+        body = _child_of_type(class_node, "class_body")
+        if body is None:
+            continue
+
+        for member in body.children:
+            if member.type != "method_definition":
+                continue
+            prop_node = _child_of_type(member, "property_identifier", "identifier")
+            if prop_node is None or _node_text(prop_node, src) != "constructor":
+                continue
+
+            formal_params = _child_of_type(member, "formal_parameters")
+            if formal_params is None:
+                continue
+
+            for param in formal_params.children:
+                if param.type not in (
+                    "required_parameter",
+                    "optional_parameter",
+                    "rest_pattern",
+                ):
+                    continue
+                # Must have an accessibility modifier to be a property injection
+                has_modifier = any(
+                    c.type == "accessibility_modifier" for c in param.children
+                )
+                if not has_modifier:
+                    continue
+
+                # Find the identifier (parameter name) and type_annotation
+                ident_node = _child_of_type(param, "identifier")
+                type_ann = _child_of_type(param, "type_annotation")
+                if ident_node is None or type_ann is None:
+                    continue
+
+                # type_annotation → ":" type  — grab the first type_identifier
+                type_id = None
+                for desc in _iter_nodes(type_ann):
+                    if desc.type in ("type_identifier", "identifier"):
+                        type_id = _node_text(desc, src)
+                        break
+                if type_id and type_id[0].isupper():
+                    injections.append(
+                        RawInjection(
+                            class_name=class_name,
+                            field_name=_node_text(ident_node, src),
+                            field_type=type_id,
+                            line=_start_line(param),
+                        )
+                    )
+
+    return injections
 
 
 # --- RUST -------------------------------------------------------------------
@@ -1211,6 +1406,144 @@ def _java_extract_inheritance(root: Any, src: bytes) -> list[RawInheritance]:
     return result
 
 
+def _java_extract_injections(root: Any, src: bytes) -> list[RawInjection]:
+    """Extract dependency injection edges from Java classes.
+
+    Detects three patterns:
+
+    1. **Field injection** — ``@Autowired`` / ``@Inject`` annotated field
+       declarations with a non-primitive type.
+    2. **Constructor injection** — constructor parameters when the constructor
+       carries ``@Autowired`` / ``@Inject`` annotations, or when it is the
+       sole constructor of the class.
+    3. **Lombok-style** — ``private final SomeType field`` in classes annotated
+       with ``@RequiredArgsConstructor`` (detected heuristically).
+
+    Primitive types (``int``, ``boolean``, ``String``, …) are skipped.
+    """
+    _PRIMITIVES = frozenset(
+        {
+            "int", "long", "double", "float", "boolean", "char", "byte", "short",
+            "void", "String", "Integer", "Long", "Double", "Float", "Boolean",
+            "Object",
+        }
+    )
+    _DI_ANNOTATIONS = frozenset({"Autowired", "Inject", "Resource"})
+    injections: list[RawInjection] = []
+
+    for class_node in _iter_nodes(root):
+        if class_node.type != "class_declaration":
+            continue
+        name_node = _child_of_type(class_node, "identifier")
+        if name_node is None:
+            continue
+        class_name = _node_text(name_node, src)
+
+        body = _child_of_type(class_node, "class_body")
+        if body is None:
+            continue
+
+        # Detect Lombok @RequiredArgsConstructor on the class
+        class_modifiers = _child_of_type(class_node, "modifiers")
+        is_lombok = False
+        if class_modifiers:
+            for ann in class_modifiers.children:
+                if ann.type == "annotation":
+                    ann_name = _child_of_type(ann, "identifier")
+                    if ann_name and _node_text(ann_name, src) == "RequiredArgsConstructor":
+                        is_lombok = True
+                        break
+
+        for member in body.children:
+            # --- Pattern 1 & 3: field declarations ---
+            if member.type == "field_declaration":
+                modifiers = _child_of_type(member, "modifiers")
+                has_di_annotation = False
+                is_final = False
+                if modifiers:
+                    for mod in modifiers.children:
+                        if mod.type == "annotation":
+                            ann_name = _child_of_type(mod, "identifier")
+                            if ann_name and _node_text(ann_name, src) in _DI_ANNOTATIONS:
+                                has_di_annotation = True
+                        if mod.type == "final":
+                            is_final = True
+
+                if not (has_di_annotation or (is_lombok and is_final)):
+                    continue
+
+                # Get field type — first type_identifier node
+                type_node = None
+                for c in member.children:
+                    if c.type in ("type_identifier", "generic_type"):
+                        type_node = c
+                        break
+                if type_node is None:
+                    continue
+                type_name = _node_text(type_node, src).split("<")[0].strip()
+                if type_name in _PRIMITIVES:
+                    continue
+
+                # Get declarator name
+                declarator = _child_of_type(member, "variable_declarator")
+                if declarator:
+                    field_id = _child_of_type(declarator, "identifier")
+                    field_name = _node_text(field_id, src) if field_id else None
+                else:
+                    field_name = None
+
+                injections.append(
+                    RawInjection(
+                        class_name=class_name,
+                        field_name=field_name,
+                        field_type=type_name,
+                        line=_start_line(member),
+                    )
+                )
+
+            # --- Pattern 2: constructor injection ---
+            elif member.type == "constructor_declaration":
+                modifiers = _child_of_type(member, "modifiers")
+                has_di_annotation = False
+                if modifiers:
+                    for mod in modifiers.children:
+                        if mod.type == "annotation":
+                            ann_name = _child_of_type(mod, "identifier")
+                            if ann_name and _node_text(ann_name, src) in _DI_ANNOTATIONS:
+                                has_di_annotation = True
+                                break
+                if not has_di_annotation:
+                    continue
+
+                params = _child_of_type(member, "formal_parameters")
+                if params is None:
+                    continue
+                for param in params.children:
+                    if param.type != "formal_parameter":
+                        continue
+                    type_node = None
+                    for c in param.children:
+                        if c.type in ("type_identifier", "generic_type"):
+                            type_node = c
+                            break
+                    if type_node is None:
+                        continue
+                    type_name = _node_text(type_node, src).split("<")[0].strip()
+                    if type_name in _PRIMITIVES:
+                        continue
+                    param_id = _child_of_type(param, "identifier")
+                    injections.append(
+                        RawInjection(
+                            class_name=class_name,
+                            field_name=_node_text(param_id, src) if param_id else None,
+                            field_type=type_name,
+                            line=_start_line(param),
+                        )
+                    )
+
+    return injections
+
+
 # ---------------------------------------------------------------------------
 # Dispatch tables
 # ---------------------------------------------------------------------------
@@ -1249,6 +1582,12 @@ _INHERITANCE_EXTRACTORS = {
     Language.RUST: _rust_extract_inheritance,
     Language.GO: _go_extract_inheritance,
     Language.JAVA: _java_extract_inheritance,
+}
+
+_INJECTION_EXTRACTORS = {
+    Language.PYTHON: _python_extract_injections,
+    Language.TYPESCRIPT: _js_extract_injections,
+    Language.JAVA: _java_extract_injections,
 }
 
 
@@ -1301,6 +1640,7 @@ class GraphExtractor:
         imp_fn = _IMPORT_EXTRACTORS.get(language)
         call_fn = _CALL_EXTRACTORS.get(language)
         inh_fn = _INHERITANCE_EXTRACTORS.get(language)
+        inj_fn = _INJECTION_EXTRACTORS.get(language)
 
         if sym_fn:
             try:
@@ -1325,5 +1665,11 @@ class GraphExtractor:
                 result.inheritance = inh_fn(root, source_bytes)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Inheritance extraction failed for %s: %s", file_path, exc)
+
+        if inj_fn:
+            try:
+                result.injections = inj_fn(root, source_bytes)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Injection extraction failed for %s: %s", file_path, exc)
 
         return result

@@ -8,7 +8,7 @@ Nodes::
 
     (:File       {id, path, language, sha256})
     (:Symbol     {id, name, qualified_name, kind, file_id, file_path,
-                  start_line, end_line, parent_name, docstring})
+                  start_line, end_line, parent_name, docstring, decorators})
     (:Directory  {id, path, name})
 
 Relationships::
@@ -18,6 +18,7 @@ Relationships::
     (:Symbol)-[:CONTAINS                                                       ]->(:Symbol)
     (:Symbol)-[:CALLS     {line, count}                                        ]->(:Symbol)
     (:Symbol)-[:INHERITS_FROM                                                  ]->(:Symbol)
+    (:Symbol)-[:INJECTS   {field_name, field_type, line}                       ]->(:Symbol)
     (:Symbol)-[:REFERENCES {line}                                              ]->(:Symbol)
     (:File/:Directory)-[:PART_OF                                               ]->(:Directory)
 
@@ -152,6 +153,7 @@ class Neo4jGraphStore(BaseGraphStore):
                 "end_line": sn.end_line,
                 "parent_name": sn.parent_name,
                 "docstring": sn.docstring,
+                "decorators": sn.decorators,
             }
             for sn in snapshot.symbol_nodes.values()
         ]
@@ -167,7 +169,8 @@ class Neo4jGraphStore(BaseGraphStore):
                 s.start_line = row.start_line,
                 s.end_line = row.end_line,
                 s.parent_name = row.parent_name,
-                s.docstring = row.docstring
+                s.docstring = row.docstring,
+                s.decorators = row.decorators
             """,
             sym_rows,
         )
@@ -484,6 +487,7 @@ class Neo4jGraphStore(BaseGraphStore):
             end_line=node["end_line"],
             parent_name=node.get("parent_name"),
             docstring=node.get("docstring"),
+            decorators=list(node.get("decorators") or []),
         )
 
     @staticmethod

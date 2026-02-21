@@ -399,12 +399,39 @@ waiting to happen.
 
 ---
 
+## What Tree-sitter CAN Do Well for Relation Extraction
+
+Even though it cannot resolve polymorphic calls, Tree-sitter excels at
+extracting **explicit structural patterns** that are syntactically unambiguous:
+
+| Pattern | Why Tree-sitter is sufficient | Implementation |
+|---------|------------------------------|----------------|
+| **Decorators / annotations** | `@decorator` is syntactic, no type inference needed | `SymbolNode.decorators: list[str]` |
+| **Constructor parameter types** | `def __init__(self, repo: UserRepository)` — type names are literals | `INJECTS` edges via `_python_extract_injections()` |
+| **Typed field annotations** | `gateway: StripeGateway` — type name is a literal | Same `INJECTS` extractor |
+| **Java `@Autowired` fields** | Annotation is syntactically explicit | `_java_extract_injections()` |
+| **TypeScript constructor properties** | `private readonly svc: Service` — access modifiers + type are literal | `_js_extract_injections()` |
+
+These patterns are "free" precision improvements that Tree-sitter can provide
+with high accuracy — the type name is always a literal identifier, never
+inferred.  They complement the call graph by adding a **data-dependency
+dimension** that the call graph alone misses.
+
+---
+
 ## Recommended Architecture for This Project
 
 ```
-Phase 1 (current)
-  Tree-sitter extraction → three-tier name resolution → CALLS edges with confidence
+Phase 1 (complete)
+  Tree-sitter extraction → three-tier name resolution → CALLS + INHERITS_FROM edges
   Suitable for: RAG, code search, approximate impact analysis
+
+Phase 1.5 (complete — informed by vitali87/code-graph-rag + arXiv:2601.08773)
+  + INJECTS edges from constructor/field type extraction (Python, TypeScript, Java)
+  + decorators: list[str] on SymbolNode (enables @-based query filtering)
+  + to_mermaid() on SymbolContext / ImpactResult (compact LLM context)
+  → Data-dependency graph fills the largest gap that pure call graphs miss
+  → Decorator filtering enables semantic search patterns (find all @task, @route, etc.)
 
 Phase 2 (next)
   + Pyright/gopls type map consumed at index time
@@ -417,6 +444,7 @@ Phase 3 (future)
   → Enables rename refactoring, cross-repo impact, API surface diffing
 ```
 
-The current three-tier Tree-sitter approach is a pragmatic Phase 1.  It will
-surface the majority of impacts with acceptable recall for most codebases.
-Phase 2 is the correct next investment once the indexing pipeline is stable.
+The current three-tier Tree-sitter approach with `INJECTS` edges is a strong
+Phase 1.5.  It surfaces the majority of structural dependencies with minimal
+overhead and zero external tool dependencies.  Phase 2 is the correct next
+investment once the indexing pipeline is stable.

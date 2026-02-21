@@ -15,6 +15,7 @@ Edge / relationship types
 * ``INHERITS_FROM``  — ``(:Symbol)→[:INHERITS_FROM]→(:Symbol)``
 * ``REFERENCES``     — ``(:Symbol)→[:REFERENCES]→(:Symbol)``
 * ``PART_OF``        — ``(:File/:Directory)→[:PART_OF]→(:Directory)``
+* ``INJECTS``        — ``(:Symbol)→[:INJECTS]→(:Symbol)``  (class→dependency type)
 """
 
 from __future__ import annotations
@@ -67,6 +68,7 @@ class RelType(str, Enum):
     CONTAINS = "CONTAINS"
     CALLS = "CALLS"
     INHERITS_FROM = "INHERITS_FROM"
+    INJECTS = "INJECTS"
     REFERENCES = "REFERENCES"
     PART_OF = "PART_OF"
 
@@ -115,6 +117,9 @@ class SymbolNode(BaseModel):
         parent_name:    For methods/nested functions: short name of the
                         containing class or function.  ``None`` for top-level.
         docstring:      First docstring / leading comment, if extracted.
+        decorators:     Decorator / annotation names applied to this symbol,
+                        e.g. ``["staticmethod", "router.get", "pytest.mark.skip"]``.
+                        Empty list when no decorators are present.
         node_type:      Always ``NodeType.SYMBOL``.
     """
 
@@ -128,6 +133,7 @@ class SymbolNode(BaseModel):
     end_line: int
     parent_name: str | None = None
     docstring: str | None = None
+    decorators: list[str] = Field(default_factory=list)
     node_type: NodeType = NodeType.SYMBOL
 
     @classmethod
@@ -295,6 +301,64 @@ class SymbolContext(BaseModel):
         if self.file_imports:
             paths = ", ".join(f.path for f in self.file_imports[:5])
             lines.append(f"File imports: {paths}")
+        if self.symbol.decorators:
+            lines.append(f"Decorators: {', '.join(self.symbol.decorators)}")
+        return "\n".join(lines)
+
+    def to_mermaid(self) -> str:
+        """Render a Mermaid flowchart of the call neighbourhood for LLM context.
+
+        The diagram places the focal symbol in the centre, with callers above
+        and callees below.  Inheritance and class membership are shown as
+        separate edge styles.
+
+        Example output::
+
+            flowchart TD
+                _self["verify_token [method]"]
+                _caller_0["handle_request [function]"]
+                _caller_0 -->|calls| _self
+                _callee_0["decode_jwt [function]"]
+                _self -->|calls| _callee_0
+                _parent["JWTHandler [class]"]
+                _parent -->|contains| _self
+        """
+        # Sanitise label text (no quotes inside Mermaid labels)
+        def _lbl(sym: "SymbolNode") -> str:
+            return f'{sym.name} [{sym.kind.value}]'.replace('"', "'")
+
+        def _node_id(sym: "SymbolNode") -> str:
+            return f"n{sym.id}"
+
+        lines = ["flowchart TD"]
+        focal_id = "_self"
+        focal_label = _lbl(self.symbol)
+        lines.append(f'    {focal_id}["{focal_label}"]')
+
+        for i, caller in enumerate(self.callers[:8]):
+            nid = f"_caller_{i}"
+            lines.append(f'    {nid}["{_lbl(caller)}"]')
+            lines.append(f"    {nid} -->|calls| {focal_id}")
+
+        for i, callee in enumerate(self.callees[:8]):
+            nid = f"_callee_{i}"
+            lines.append(f'    {nid}["{_lbl(callee)}"]')
+            lines.append(f"    {focal_id} -->|calls| {nid}")
+
+        if self.parent_class:
+            lines.append(f'    _parent["{_lbl(self.parent_class)}"]')
+            lines.append(f"    _parent -->|contains| {focal_id}")
+
+        for i, base in enumerate(self.inherits_from[:4]):
+            nid = f"_base_{i}"
+            lines.append(f'    {nid}["{_lbl(base)}"]')
+            lines.append(f"    {focal_id} -->|inherits| {nid}")
+
+        for i, sub in enumerate(self.subclasses[:4]):
+            nid = f"_sub_{i}"
+            lines.append(f'    {nid}["{_lbl(sub)}"]')
+            lines.append(f"    {nid} -->|inherits| {focal_id}")
+
         return "\n".join(lines)
 
 
@@ -333,6 +397,52 @@ class ImpactResult(BaseModel):
     affected_files: list[FileNode] = Field(default_factory=list)
     confidence_breakdown: dict[str, int] = Field(default_factory=dict)
     min_confidence_used: float = 0.0
+
+    def to_mermaid(self) -> str:
+        """Render a Mermaid flowchart of the full impact blast radius.
+
+        The changed symbol is highlighted.  Direct callers appear one hop
+        away; transitive-only callers are shown further out.  Subclasses are
+        shown with a dashed inheritance arrow.
+
+        Example output::
+
+            flowchart TD
+                _target["◆ verify_token [method]  ← CHANGED"]:::changed
+                _dc_0["handle_request [function]"]
+                _dc_0 -->|calls| _target
+                _tc_0["middleware [function]"]
+                _tc_0 -.->|transitive| _target
+                classDef changed fill:#f96,stroke:#c33,color:#000
+        """
+        def _lbl(sym: "SymbolNode") -> str:
+            return f'{sym.name} [{sym.kind.value}]'.replace('"', "'")
+
+        direct_ids: set[str] = {s.id for s in self.direct_callers}
+        lines = ["flowchart TD"]
+        lines.append(
+            f'    _target["◆ {_lbl(self.symbol)}  ← CHANGED"]:::changed'
+        )
+
+        for i, sym in enumerate(self.direct_callers[:12]):
+            nid = f"_dc_{i}"
+            lines.append(f'    {nid}["{_lbl(sym)}"]')
+            lines.append(f"    {nid} -->|calls| _target")
+
+        for i, sym in enumerate(self.transitive_callers[:12]):
+            if sym.id in direct_ids:
+                continue
+            nid = f"_tc_{i}"
+            lines.append(f'    {nid}["{_lbl(sym)}"]')
+            lines.append(f"    {nid} -.->|transitive| _target")
+
+        for i, sym in enumerate(self.subclasses[:6]):
+            nid = f"_sub_{i}"
+            lines.append(f'    {nid}["{_lbl(sym)}"]')
+            lines.append(f"    {nid} -->|inherits| _target")
+
+        lines.append("    classDef changed fill:#f96,stroke:#c33,color:#000")
+        return "\n".join(lines)
 
 
 class GraphStats(BaseModel):
@@ -405,6 +515,43 @@ class RawSymbol(BaseModel):
     end_line: int
     parent_name: str | None = None
     """Containing class name for methods, ``None`` for top-level."""
+    decorators: list[str] = Field(default_factory=list)
+    """Decorator / annotation names applied to this symbol (stripped of ``@``)."""
+
+
+class RawInjection(BaseModel):
+    """A dependency-injection edge extracted from constructor or field types.
+
+    Represents a structural dependency where ``class_name`` depends on
+    ``field_type`` via a typed constructor parameter or annotated class field.
+
+    Examples
+    --------
+    Python constructor injection::
+
+        class OrderService:
+            def __init__(self, repo: OrderRepository): ...
+        # → RawInjection(class_name="OrderService", field_name="repo",
+        #                field_type="OrderRepository")
+
+    Python field annotation::
+
+        class PaymentService:
+            gateway: StripeGateway
+        # → RawInjection(class_name="PaymentService", field_name="gateway",
+        #                field_type="StripeGateway")
+
+    Java field annotation::
+
+        @Autowired private UserRepository userRepo;
+        # → RawInjection(class_name="<enclosing class>", field_name="userRepo",
+        #                field_type="UserRepository")
+    """
+
+    class_name: str
+    field_name: str | None = None
+    field_type: str
+    line: int = 0
 
 
 class FileExtractionResult(BaseModel):
@@ -416,3 +563,5 @@ class FileExtractionResult(BaseModel):
     imports: list[RawImport] = Field(default_factory=list)
     calls: list[RawCall] = Field(default_factory=list)
     inheritance: list[RawInheritance] = Field(default_factory=list)
+    injections: list[RawInjection] = Field(default_factory=list)
+    """Dependency-injection edges (constructor params / typed fields)."""
