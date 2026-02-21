@@ -411,47 +411,44 @@ class SymbolContext(BaseModel):
         Example output::
 
             flowchart TD
-                _self["verify_token [method]"]
-                _caller_0["handle_request [function]"]
-                _caller_0 -->|calls| _self
-                _callee_0["decode_jwt [function]"]
-                _self -->|calls| _callee_0
-                _parent["JWTHandler [class]"]
-                _parent -->|contains| _self
+                focal["verify_token [method]"]
+                caller0["handle_request [function]"]
+                caller0 -->|calls| focal
+                callee0["decode_jwt [function]"]
+                focal -->|calls| callee0
+                parent["JWTHandler [class]"]
+                parent -->|contains| focal
         """
         # Sanitise label text (no quotes inside Mermaid labels)
         def _lbl(sym: "SymbolNode") -> str:
             return f'{sym.name} [{sym.kind.value}]'.replace('"', "'")
 
-        def _node_id(sym: "SymbolNode") -> str:
-            return f"n{sym.id}"
-
         lines = ["flowchart TD"]
-        focal_id = "_self"
+        focal_id = "focal"
         focal_label = _lbl(self.symbol)
         lines.append(f'    {focal_id}["{focal_label}"]')
 
         for i, caller in enumerate(self.callers[:8]):
-            nid = f"_caller_{i}"
+            nid = f"caller{i}"
             lines.append(f'    {nid}["{_lbl(caller)}"]')
             lines.append(f"    {nid} -->|calls| {focal_id}")
 
         for i, callee in enumerate(self.callees[:8]):
-            nid = f"_callee_{i}"
+            nid = f"callee{i}"
             lines.append(f'    {nid}["{_lbl(callee)}"]')
             lines.append(f"    {focal_id} -->|calls| {nid}")
 
         if self.parent_class:
-            lines.append(f'    _parent["{_lbl(self.parent_class)}"]')
-            lines.append(f"    _parent -->|contains| {focal_id}")
+            lines.append(f'    parent["{_lbl(self.parent_class)}"]')
+            lines.append(f"    parent -->|contains| {focal_id}")
 
         for i, base in enumerate(self.inherits_from[:4]):
-            nid = f"_base_{i}"
+            nid = f"base{i}"
             lines.append(f'    {nid}["{_lbl(base)}"]')
             lines.append(f"    {focal_id} -->|inherits| {nid}")
 
         for i, sub in enumerate(self.subclasses[:4]):
-            nid = f"_sub_{i}"
+            nid = f"sub{i}"
             lines.append(f'    {nid}["{_lbl(sub)}"]')
             lines.append(f"    {nid} -->|inherits| {focal_id}")
 
