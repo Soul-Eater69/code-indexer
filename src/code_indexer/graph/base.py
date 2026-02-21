@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from code_indexer.graph.models import (
     GraphSnapshot,
     GraphStats,
+    ImpactResult,
     SymbolContext,
     SymbolNode,
 )
@@ -125,6 +126,62 @@ class BaseGraphStore(ABC):
         This is the primary query for RAG usage: returns callers, callees,
         parent class, methods (if a class), inheritance chain, and import graph.
         """
+
+    def get_impact_set(
+        self, symbol_id: str, *, min_confidence: float = 0.0
+    ) -> ImpactResult | None:
+        """Return the full impact set for a symbol change.
+
+        Combines three impact dimensions:
+
+        1. **Call-graph reverse reachability** — all transitive callers,
+           filtered by the ``min_confidence`` threshold on each edge.
+        2. **Inheritance reverse** — direct subclasses / implementors.
+        3. **File-level reverse imports** — files that directly import
+           the file defining this symbol.
+
+        Parameters
+        ----------
+        symbol_id:
+            Stable ID of the symbol that is being changed.
+        min_confidence:
+            Minimum compound edge confidence to follow (0.0 = all edges,
+            0.85 = certain-only, 0.50 = probable + certain).
+
+        Returns ``None`` if ``symbol_id`` is not found.
+
+        Concrete stores should override this for confidence-aware traversal.
+        The default implementation uses existing traversal methods at a fixed
+        large depth with no compound-confidence tracking.
+        """
+        sn = self.get_symbol_by_id(symbol_id)
+        if sn is None:
+            return None
+
+        ctx = self.get_symbol_context(symbol_id)
+        if ctx is None:
+            return None
+
+        direct_callers = self.get_callers(symbol_id, depth=1)
+        transitive_callers = self.get_callers(symbol_id, depth=100)
+        subclasses = self.get_subclasses(symbol_id)
+
+        affected_file_ids = {s.file_id for s in transitive_callers} | {
+            s.file_id for s in subclasses
+        }
+        # Build FileNode list from symbol context's file_imported_by (available at 1 hop)
+        importing_files = ctx.file_imported_by
+
+        return ImpactResult(
+            symbol=sn,
+            direct_callers=direct_callers,
+            transitive_callers=transitive_callers,
+            subclasses=subclasses,
+            importing_files=importing_files,
+            affected_files=[],  # concrete stores provide FileNode objects
+            confidence_breakdown={"certain": len(transitive_callers)},
+            min_confidence_used=min_confidence,
+        )
 
     # ------------------------------------------------------------------
     # Statistics

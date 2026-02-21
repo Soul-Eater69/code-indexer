@@ -298,6 +298,43 @@ class SymbolContext(BaseModel):
         return "\n".join(lines)
 
 
+class ImpactResult(BaseModel):
+    """Result of an impact analysis query.
+
+    Answers: "If I change symbol X, what else could break?"
+
+    Call-graph edges carry a confidence score (0.0–1.0) produced by the
+    three-tier name-match resolver.  All lists respect the ``min_confidence``
+    threshold that was applied when the query was issued.
+
+    Attributes:
+        symbol:              The symbol that is being changed.
+        direct_callers:      Symbols with a direct ``CALLS`` edge to this symbol.
+        transitive_callers:  All reachable callers (unlimited BFS, includes
+                             direct callers).  Filtered by ``min_confidence``.
+        subclasses:          Direct subclasses / implementors — relevant when
+                             the changed symbol is a class or interface.
+        importing_files:     Files that directly import the file containing
+                             this symbol.  These always need review.
+        affected_files:      Deduplicated set of files containing any symbol in
+                             ``transitive_callers`` or ``subclasses``.  This is
+                             the minimal set of files that should be retested.
+        confidence_breakdown: Count of transitive callers by confidence tier:
+                              ``certain`` (≥ 0.85), ``probable`` (0.50–0.84),
+                              ``speculative`` (< 0.50).
+        min_confidence_used: The threshold that was applied.
+    """
+
+    symbol: SymbolNode
+    direct_callers: list[SymbolNode] = Field(default_factory=list)
+    transitive_callers: list[SymbolNode] = Field(default_factory=list)
+    subclasses: list[SymbolNode] = Field(default_factory=list)
+    importing_files: list[FileNode] = Field(default_factory=list)
+    affected_files: list[FileNode] = Field(default_factory=list)
+    confidence_breakdown: dict[str, int] = Field(default_factory=dict)
+    min_confidence_used: float = 0.0
+
+
 class GraphStats(BaseModel):
     """Statistics about the current graph index."""
 

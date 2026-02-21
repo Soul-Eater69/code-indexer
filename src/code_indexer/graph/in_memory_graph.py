@@ -30,6 +30,7 @@ from code_indexer.graph.models import (
     GraphEdge,
     GraphSnapshot,
     GraphStats,
+    ImpactResult,
     NodeType,
     RelType,
     SymbolContext,
@@ -315,6 +316,142 @@ class InMemoryGraphStore(BaseGraphStore):
             file_imports=file_imports,
             file_imported_by=file_imported_by,
         )
+
+    # ------------------------------------------------------------------
+    # Impact analysis
+    # ------------------------------------------------------------------
+
+    def get_impact_set(
+        self, symbol_id: str, *, min_confidence: float = 0.0
+    ) -> ImpactResult | None:
+        """Confidence-aware impact analysis for a symbol change.
+
+        Traverses the graph in three dimensions:
+
+        1. **Reverse call graph** — BFS over incoming ``CALLS`` edges,
+           tracking compound confidence (``min`` across the path).  Edges
+           whose compound confidence falls below ``min_confidence`` are pruned.
+        2. **Reverse inheritance** — direct ``INHERITS_FROM`` reverse
+           (subclasses / implementors).
+        3. **Reverse imports** — files that directly import the file containing
+           the changed symbol.
+        """
+        sn = self._get_symbol(symbol_id)
+        if sn is None:
+            return None
+
+        fn = self._get_file(sn.file_id)
+        if fn is None:
+            return None
+
+        # --- 1. Transitive callers with compound-confidence tracking ---
+        all_callers, confidence_map = self._bfs_incoming_with_confidence(
+            symbol_id, min_confidence
+        )
+
+        # Direct callers = 1-hop subset of all_callers that passed the filter
+        direct_caller_ids = {
+            nid for nid in self._in_neighbours(symbol_id, RelType.CALLS)
+        }
+        direct_callers = [s for s in all_callers if s.id in direct_caller_ids]
+
+        # --- 2. Subclasses ---
+        subclasses = self.get_subclasses(symbol_id)
+
+        # --- 3. Reverse imports (files that import THIS file) ---
+        importing_file_ids = self._in_neighbours(sn.file_id, RelType.IMPORTS)
+        importing_files = [
+            f for fid in importing_file_ids if (f := self._get_file(fid)) is not None
+        ]
+
+        # --- 4. Affected files ---
+        affected_file_ids: set[str] = {s.file_id for s in all_callers} | {
+            s.file_id for s in subclasses
+        }
+        affected_files = [
+            f for fid in affected_file_ids if (f := self._get_file(fid)) is not None
+        ]
+
+        # --- 5. Confidence breakdown ---
+        certain = sum(1 for c in confidence_map.values() if c >= 0.85)
+        probable = sum(1 for c in confidence_map.values() if 0.50 <= c < 0.85)
+        speculative = sum(1 for c in confidence_map.values() if c < 0.50)
+
+        return ImpactResult(
+            symbol=sn,
+            direct_callers=direct_callers,
+            transitive_callers=all_callers,
+            subclasses=subclasses,
+            importing_files=importing_files,
+            affected_files=affected_files,
+            confidence_breakdown={
+                "certain": certain,
+                "probable": probable,
+                "speculative": speculative,
+            },
+            min_confidence_used=min_confidence,
+        )
+
+    def _bfs_incoming_with_confidence(
+        self, start_id: str, min_confidence: float
+    ) -> tuple[list[SymbolNode], dict[str, float]]:
+        """BFS over reversed CALLS edges tracking compound (min-path) confidence.
+
+        For each reachable node the *highest* compound confidence found across
+        all paths is recorded.  This is conservative for impact analysis: we
+        report a node as "certain" only if there is a high-confidence path to
+        it.
+
+        Returns
+        -------
+        results:
+            Symbols reachable via reversed CALLS with compound confidence >=
+            ``min_confidence``, in BFS discovery order.
+        confidence_map:
+            ``{symbol_id: best_compound_confidence}``.
+        """
+        visited: set[str] = {start_id}
+        result: list[SymbolNode] = []
+        confidence_map: dict[str, float] = {}
+        queue: deque[tuple[str, float]] = deque([(start_id, 1.0)])
+
+        while queue:
+            node_id, path_confidence = queue.popleft()
+
+            if self._using_nx:
+                in_edges = [
+                    (src, data)
+                    for src, _tgt, data in self._g.in_edges(node_id, data=True)
+                    if data.get("rel_type") == RelType.CALLS
+                ]
+            else:
+                in_edges = [
+                    (e["source"], e)
+                    for e in self._g.in_edges(node_id, RelType.CALLS)
+                ]
+
+            for src, data in in_edges:
+                props = data.get("properties", {})
+                edge_conf: float = props.get("confidence", 0.5)
+                compound = min(path_confidence, edge_conf)
+
+                if compound < min_confidence:
+                    continue
+
+                if src in visited:
+                    # Update if this path has higher confidence
+                    if compound > confidence_map.get(src, 0.0):
+                        confidence_map[src] = compound
+                    continue
+
+                visited.add(src)
+                confidence_map[src] = compound
+                sn = self._get_symbol(src)
+                if sn:
+                    result.append(sn)
+                queue.append((src, compound))
+
+        return result, confidence_map
 
     # ------------------------------------------------------------------
     # Statistics

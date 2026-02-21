@@ -18,6 +18,7 @@ POST  /graph/import-graph     — Import graph for a file
 POST  /graph/subclasses       — Subclasses of a symbol
 POST  /graph/superclasses     — Base classes of a symbol
 POST  /graph/context          — Full structural context (for RAG)
+POST  /graph/impact           — Impact analysis: what breaks if this symbol changes?
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from code_indexer.graph.models import GraphStats, SymbolContext, SymbolNode
+from code_indexer.graph.models import GraphStats, ImpactResult, SymbolContext, SymbolNode
 from code_indexer.graph.pipeline import GraphIndexResult, GraphIndexingPipeline
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,14 @@ class ContextRequest(BaseModel):
     symbol_id: str | None = None
     symbol_name: str | None = None
     """If ``symbol_id`` is not provided, the first symbol with this name is used."""
+
+
+class ImpactRequest(BaseModel):
+    symbol_id: str | None = None
+    symbol_name: str | None = None
+    """If ``symbol_id`` is not provided, the first symbol with this name is used."""
+    min_confidence: float = 0.0
+    """Minimum compound call-edge confidence to include (0.0 = all, 0.85 = certain-only)."""
 
 
 # ---------------------------------------------------------------------------
@@ -253,3 +262,46 @@ async def get_context(req: ContextRequest, request: Request) -> SymbolContext | 
     if ctx is None:
         raise HTTPException(status_code=404, detail=f"Symbol {symbol_id!r} not found.")
     return ctx
+
+
+@router.post("/impact", response_model=ImpactResult)
+async def get_impact(req: ImpactRequest, request: Request) -> ImpactResult:
+    """Impact analysis: what breaks if this symbol changes?
+
+    Traverses the graph in three dimensions:
+
+    * **Reverse call graph** — all transitive callers, filtered by
+      ``min_confidence``.  Confidence is compounded along each path so that a
+      chain of uncertain edges is flagged as speculative.
+    * **Reverse inheritance** — direct subclasses / implementors (relevant
+      when the changed symbol is a class or interface).
+    * **Reverse imports** — files that directly import the file containing
+      this symbol (always need review regardless of confidence).
+
+    The response includes a ``confidence_breakdown`` that splits transitive
+    callers into ``certain`` (≥ 0.85), ``probable`` (0.50–0.84), and
+    ``speculative`` (< 0.50) buckets, and an ``affected_files`` list for
+    retest planning.
+
+    Use ``min_confidence=0.85`` to surface only high-confidence impacts,
+    or ``min_confidence=0.0`` (default) for the full speculative set.
+    """
+    store = _graph_pipeline(request).store
+    symbol_id = req.symbol_id
+
+    if symbol_id is None and req.symbol_name:
+        symbols = store.find_symbols_by_name(req.symbol_name)
+        if not symbols:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No symbol named {req.symbol_name!r} found in the graph.",
+            )
+        symbol_id = symbols[0].id
+
+    if symbol_id is None:
+        raise HTTPException(status_code=422, detail="Provide either symbol_id or symbol_name.")
+
+    result = store.get_impact_set(symbol_id, min_confidence=req.min_confidence)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Symbol {symbol_id!r} not found.")
+    return result
