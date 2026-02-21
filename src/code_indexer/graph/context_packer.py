@@ -65,9 +65,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from code_indexer.graph.models import SymbolNode
+
+if TYPE_CHECKING:
+    from code_indexer.graph.concern_clusterer import Concern
 
 # ---------------------------------------------------------------------------
 # Result model
@@ -107,6 +110,7 @@ class PackedContext:
     utilization: float
     dropped: int
     strategy: str
+    concerns: list["Concern"] = field(default_factory=list)
 
     def summary(self) -> str:
         """One-line summary suitable for logging."""
@@ -135,6 +139,102 @@ class PackedContext:
                 f"  (score={score:.3f})"
             )
         return "\n".join(lines)
+
+    def to_prompt_text(self, *, include_concerns: bool = True) -> str:
+        """Render the full prompt block: concern guidance + symbol list.
+
+        When ``include_concerns=True`` (default) and concerns are present,
+        prepends a soft-guidance concern block above the symbol list.  The
+        concern block tells the LLM which high-level features are likely
+        relevant while explicitly preserving its autonomy to explore further.
+
+        Example output::
+
+            === Inferred concerns (use as guidance, not ground truth) ===
+
+            Concern: JWT token validation logic
+              Handles parsing, signature verification, and expiry checking
+              of JWT tokens in incoming API requests.
+              Relevant code (3 symbols):
+                • auth.jwt.JWTHandler.verify_token  (src/auth/jwt.py:42)
+                ...
+
+            === Context window: 14 symbols (7841 est. tokens) ===
+              [method] auth.jwt.JWTHandler.verify_token  src/auth/jwt.py:42-89  (score=0.921)
+              ...
+
+        Parameters
+        ----------
+        include_concerns:
+            Whether to prepend the concern block.  Set ``False`` to get
+            only the symbol list (equivalent to :meth:`to_context_text`).
+        """
+        parts: list[str] = []
+        if include_concerns and self.concerns:
+            parts.append(render_concern_block(self.concerns))
+            parts.append("")
+        parts.append(self.to_context_text())
+        return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Concern block renderer
+# ---------------------------------------------------------------------------
+
+
+def render_concern_block(concerns: "list[Concern]") -> str:
+    """Render a list of concerns as a soft-guidance prompt block.
+
+    Designed to be prepended to an LLM system or user prompt.  The block
+    explicitly frames the concerns as inferred hints rather than ground
+    truth, so the LLM is encouraged — but not forced — to focus on them.
+
+    Parameters
+    ----------
+    concerns:
+        Ordered list of :class:`~code_indexer.graph.concern_clusterer.Concern`
+        objects, most relevant first.
+
+    Returns
+    -------
+    str
+        Multi-line prompt text ready to be injected into an LLM message.
+
+    Example output::
+
+        === Inferred concerns (use as guidance, not ground truth) ===
+
+        Concern: JWT token validation logic
+          Handles parsing, signature verification, and expiry checking
+          of JWT tokens in incoming API requests.
+          Relevant code (3 symbols):
+            • auth.jwt.JWTHandler.verify_token  (src/auth/jwt.py:42)
+            • auth.jwt.decode_payload  (src/auth/jwt.py:89)
+
+        Concern: Session invalidation on logout
+          Removes active sessions from Redis and revokes refresh tokens
+          when a user explicitly logs out or their session expires.
+          Relevant code (2 symbols):
+            • auth.session.invalidate  (src/auth/session.py:54)
+    """
+    if not concerns:
+        return ""
+
+    lines: list[str] = [
+        "=== Inferred concerns (use as guidance, not ground truth) ===",
+        "",
+    ]
+    for concern in concerns:
+        lines.append(concern.to_prompt_block())
+        lines.append("")
+
+    # Append the soft-autonomy instruction once, after all concerns
+    lines.append(
+        "Note: these concerns are inferred automatically and may be incomplete.\n"
+        "Use them as starting points for your analysis, but continue to explore\n"
+        "the codebase independently if needed."
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +290,7 @@ class ContextPacker:
         strategy: Literal["greedy", "dp"] = "greedy",
         token_quantum: int = 64,
         min_score: float = 0.0,
+        concerns: "list[Concern] | None" = None,
     ) -> PackedContext:
         """Select the highest-value subset of ``candidates`` that fits within
         ``token_budget``.
@@ -220,6 +321,12 @@ class ContextPacker:
         min_score:
             Candidates with ``score < min_score`` are excluded before
             packing (default ``0.0`` — include all).
+        concerns:
+            Optional list of :class:`~code_indexer.graph.concern_clusterer.Concern`
+            objects produced by :class:`~code_indexer.graph.concern_clusterer.ConcernClusterer`.
+            When provided, they are attached to the returned
+            :class:`PackedContext` and rendered by
+            :meth:`PackedContext.to_prompt_text`.
 
         Returns
         -------
@@ -247,6 +354,7 @@ class ContextPacker:
                 utilization=0.0,
                 dropped=len(candidates),
                 strategy=strategy,
+                concerns=concerns or [],
             )
 
         if strategy == "dp":
@@ -269,6 +377,7 @@ class ContextPacker:
             utilization=total_tokens / token_budget if token_budget > 0 else 0.0,
             dropped=pre_filter_dropped + pack_dropped,
             strategy=strategy,
+            concerns=concerns or [],
         )
 
     # ------------------------------------------------------------------

@@ -181,6 +181,32 @@ class GraphSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GRAPH_", env_file=".env", extra="ignore")
 
 
+class LLMSettings(BaseSettings):
+    """Settings for the LLM client used by TermEnricher and ConcernClusterer.
+
+    Attributes:
+        provider:       Which LLM backend to use.
+        model:          Model for cheap bulk operations (expansion, definition,
+                        summarisation, ranking).  Default: ``gpt-4o-mini``.
+        cluster_model:  Stronger model for concern clustering (one call per
+                        query).  Default: same as ``model``.
+        api_key:        API key (OpenAI) or ignored (Ollama).
+        base_url:       Base URL for Ollama server.
+        max_tokens:     Default max output tokens per LLM call.
+        temperature:    Sampling temperature (0 = deterministic).
+    """
+
+    provider: Literal["openai", "ollama"] = "openai"
+    model: str = "gpt-4o-mini"
+    cluster_model: str = ""          # empty → fall back to ``model``
+    api_key: str = ""
+    base_url: str = "http://localhost:11434"
+    max_tokens: int = Field(default=512, ge=16, le=4096)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+
+    model_config = SettingsConfigDict(env_prefix="LLM_", env_file=".env", extra="ignore")
+
+
 class APISettings(BaseSettings):
     """Settings for the FastAPI server.
 
@@ -235,6 +261,7 @@ class Settings(BaseSettings):
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     vectorstore: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
     graph: GraphSettings = Field(default_factory=GraphSettings)
+    llm: LLMSettings = Field(default_factory=LLMSettings)
     api: APISettings = Field(default_factory=APISettings)
 
     # Global toggles
