@@ -1,10 +1,11 @@
 # Code Indexer
 
-> **Production-ready codebase indexing system for RAG and code generation.**
+> **Production-ready codebase indexing system for RAG, impact analysis, and code generation.**
 >
-> Parse your entire codebase with Tree-sitter, chunk it semantically, embed it
-> with the model of your choice, and query it in natural language — all from a
-> clean Python library, REST API, or CLI.
+> Parse your entire codebase with Tree-sitter, extract a structural knowledge
+> graph (call graph, inheritance, dependency injection), enrich identifiers with
+> LLM-generated definitions, and query everything in natural language — all from
+> a clean Python library, REST API, or CLI.
 
 ---
 
@@ -19,6 +20,8 @@
    - [Stage 4 — Embedding](#stage-4--embedding)
    - [Stage 5 — Vector Store](#stage-5--vector-store)
    - [Stage 6 — Retrieval](#stage-6--retrieval)
+   - [Stage 7 — Graph Extraction](#stage-7--graph-extraction)
+   - [Stage 8 — Semantic Enrichment](#stage-8--semantic-enrichment)
 4. [Data Flow Diagram](#data-flow-diagram)
 5. [Module Map](#module-map)
 6. [Quick Start](#quick-start)
@@ -28,9 +31,10 @@
 10. [Chunking Strategies Explained](#chunking-strategies-explained)
 11. [Embedding Backend Comparison](#embedding-backend-comparison)
 12. [Vector Store Backend Comparison](#vector-store-backend-comparison)
-13. [RAG Integration Guide](#rag-integration-guide)
-14. [Deployment Guide](#deployment-guide)
-15. [Development Guide](#development-guide)
+13. [Graph Store Backend Comparison](#graph-store-backend-comparison)
+14. [RAG Integration Guide](#rag-integration-guide)
+15. [Deployment Guide](#deployment-guide)
+16. [Development Guide](#development-guide)
 
 ---
 
@@ -43,30 +47,52 @@
 | Different codebases use different languages | Tree-sitter grammars for 8+ languages out of the box |
 | Expensive GPU embedding runs | Local `sentence-transformers` or remote OpenAI/Ollama |
 | Locked into one vector DB | Pluggable: ChromaDB, Qdrant, or in-memory |
+| "What breaks if I change X?" is unanswerable | Call-graph + inheritance + INJECTS edges → impact analysis |
+| DI dependencies invisible to the call graph | `INJECTS` edges capture constructor-injected types |
+| Abbreviations like `req`/`tx` miss semantic search | `TermEnricher` LLM-expands identifiers before indexing |
+| Flat ranked lists hide cross-file structure | `ConcernClusterer` groups results into named themes |
 | Complex setup required | One command: `code-indexer index ./myrepo` |
 
 ---
 
 ## Architecture Overview
 
-The system is built as a **layered pipeline** where each layer has a clean
-abstract interface and multiple interchangeable implementations.
+The system is built as two complementary pipelines sharing the same
+Tree-sitter parsing layer, each with a clean abstract interface and
+multiple interchangeable backends.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          CODE INDEXER SYSTEM                            │
 │                                                                         │
-│   ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌───────────┐  │
-│   │  CLI / API │    │  Indexing  │    │  Retrieval │    │  Vector   │  │
-│   │  Layer     │───▶│  Pipeline  │───▶│  Layer     │◀──▶│  Store    │  │
-│   └────────────┘    └─────┬──────┘    └────────────┘    └───────────┘  │
-│                           │                                             │
-│               ┌───────────┼───────────────┐                            │
-│               ▼           ▼               ▼                            │
-│         ┌──────────┐ ┌──────────┐ ┌──────────────┐                    │
-│         │  Parser  │ │ Chunker  │ │  Embedder    │                    │
-│         │ (TS AST) │ │ (3 strat)│ │ (3 backends) │                    │
-│         └──────────┘ └──────────┘ └──────────────┘                    │
+│   ┌────────────┐    ┌──────────────────────────────────────────────┐   │
+│   │  CLI / API │    │              Indexing Pipelines               │   │
+│   │  Layer     │───▶│                                              │   │
+│   └────────────┘    │  ┌─────────────────┐  ┌────────────────────┐│   │
+│                     │  │  Vector Pipeline │  │   Graph Pipeline   ││   │
+│                     │  │                 │  │                    ││   │
+│                     │  │ Parser→Chunker  │  │ Parser→GraphExtract││   │
+│                     │  │ →Embedder       │  │ →TermEnricher      ││   │
+│                     │  │ →VectorStore    │  │ →GraphStore        ││   │
+│                     │  └────────┬────────┘  └─────────┬──────────┘│   │
+│                     └──────────────────────────────────────────────┘   │
+│                               │                        │               │
+│                               ▼                        ▼               │
+│                     ┌──────────────────┐    ┌─────────────────────┐   │
+│                     │   Vector Store   │    │    Graph Store      │   │
+│                     │ ChromaDB/Qdrant/ │    │  in-memory / Neo4j  │   │
+│                     │ in-memory        │    │  5 edge types       │   │
+│                     └──────────────────┘    └─────────────────────┘   │
+│                               │                        │               │
+│                               └───────────┬────────────┘               │
+│                                           ▼                            │
+│                                ┌─────────────────────┐                 │
+│                                │  HybridRetriever    │                 │
+│                                │  vector + graph     │                 │
+│                                │  + Katz centrality  │                 │
+│                                │  + ContextPacker    │                 │
+│                                │  + ConcernClusterer │                 │
+│                                └─────────────────────┘                 │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -79,8 +105,13 @@ abstract interface and multiple interchangeable implementations.
 | **Chunker** | Split code into indexable chunks | `chunkers/ast_chunker.py`, `token_chunker.py` |
 | **Embedder** | Convert text to vectors | `embeddings/openai_embedder.py`, etc. |
 | **Vector Store** | Store and retrieve vectors | `vectorstore/chroma_store.py`, etc. |
-| **Retriever** | Query the index | `retrieval/retriever.py` |
-| **API** | FastAPI REST endpoints | `api/app.py`, `api/routes/` |
+| **Graph Extractor** | Extract CALLS / IMPORTS / INHERITS_FROM / INJECTS edges | `graph/pipeline.py` |
+| **Graph Store** | Store nodes + edges, run traversal queries | `graph/in_memory_graph.py`, `graph/neo4j_store.py` |
+| **TermEnricher** | LLM-expand identifiers, generate definitions | `graph/term_enricher.py` |
+| **ConcernClusterer** | Group retrieved results into named themes | `graph/concern_clusterer.py` |
+| **ContextPacker** | Knapsack-optimal symbol selection for token budget | `graph/context_packer.py` |
+| **Retriever** | Vector + graph hybrid query with Katz scoring | `retrieval/retriever.py` |
+| **API** | FastAPI REST endpoints (vector + graph) | `api/app.py`, `api/routes/` |
 | **CLI** | `click`-based terminal interface | `cli/main.py` |
 
 ---
@@ -333,6 +364,79 @@ improves precision for code-specific queries.
 
 ---
 
+### Stage 7 — Graph Extraction
+
+Runs in parallel with the vector pipeline (or on its own via `code-indexer graph index`).
+The `GraphExtractor` walks the same Tree-sitter AST and builds a typed property graph.
+
+```
+ParsedFile (AST)
+    │
+    ▼  GraphExtractor.extract(parsed_file)
+    │
+    ├── FileNode          {id, path, language, sha256}
+    │
+    ├── SymbolNode[]      {id, name, qualified_name, kind,
+    │                      file_path, start_line, end_line, decorators}
+    │
+    └── GraphEdge[]
+            DEFINES        File → Symbol
+            CONTAINS       Class → Method
+            IMPORTS        File → File  {module_string, is_relative}
+            CALLS          Symbol → Symbol  {line, count}
+            INHERITS_FROM  Symbol → Symbol
+            INJECTS        Symbol → Symbol  {field_name, field_type}
+```
+
+**Call resolution** uses a three-tier name matcher:
+
+```
+1. Exact qualified name match   → confidence 1.0
+2. Unqualified name match       → confidence 0.8
+3. Suffix / fuzzy match         → confidence 0.6
+```
+
+Edges below the `min_confidence` threshold are dropped before storage.
+
+**INJECTS edges** are extracted from constructor parameters and typed class
+fields (Python `__init__`, TypeScript constructor, Java `@Autowired`) — capturing
+dependency-injection relationships that pure call graphs miss.
+
+---
+
+### Stage 8 — Semantic Enrichment
+
+Runs offline once per codebase.  All results are persisted to `.term_kb.json`
+so enrichment cost is paid once and amortised across all future queries.
+
+```
+SymbolNode[]
+    │
+    ▼  split_identifier(sym.name)
+    │  getUserByEmail → ["get", "user", "by", "email"]
+    │
+    ▼  TermEnricher (LLM: cheap model, e.g. gpt-4o-mini)
+    │  For each short/abbreviated token:
+    │    1. Expand:  "req" → "HTTP request"   (context-aware)
+    │    2. Define:  "HTTP request" → "Structured message sent by a client to a server"
+    │
+    ▼  EnrichedTerm[]  stored in TermKnowledgeBase
+    │
+    ▼  TermChunkExtractor (LLM: cheap model)
+    │  For each (symbol, term) pair:
+    │    "Describe only what handle_payment does with rate limiting"
+    │    → focused one-sentence summary
+    │
+    ▼  TermChunk[]  embedded and added to vector store
+       (alongside whole-function chunks)
+```
+
+At query time, `ConcernClusterer` groups retrieved `TermChunk` results into
+2–5 named concerns using a stronger model (e.g. `gpt-4o`), and
+`render_concern_block()` prepends a soft-guidance map to the LLM prompt.
+
+---
+
 ## Data Flow Diagram
 
 ```
@@ -475,6 +579,33 @@ src/code_indexer/
 │   └── pipeline.py        ← IndexingPipeline (orchestrator)
 │                              build_chunker() / build_embedder() / build_vector_store()
 │
+├── graph/
+│   ├── models.py          ← Graph Pydantic models
+│   │   ├── FileNode       – source file node
+│   │   ├── SymbolNode     – function / class / method / … node
+│   │   ├── DirectoryNode  – directory node
+│   │   ├── GraphEdge      – typed directed edge (CALLS, IMPORTS, …)
+│   │   ├── GraphSnapshot  – full in-memory graph + Katz centrality
+│   │   ├── SymbolContext  – neighbourhood for one symbol + to_mermaid()
+│   │   └── ImpactResult   – blast-radius result + to_mermaid()
+│   │
+│   ├── extractor.py       ← GraphExtractor: AST → nodes + edges
+│   ├── pipeline.py        ← GraphIndexingPipeline, build_graph_store()
+│   ├── in_memory_graph.py ← InMemoryGraphStore (BFS, Katz, impact)
+│   ├── neo4j_store.py     ← Neo4jGraphStore (Cypher queries)
+│   │
+│   ├── term_utils.py      ← split_identifier()
+│   ├── term_enricher.py   ← TermEnricher, EnrichedTerm, TermKnowledgeBase
+│   ├── term_chunker.py    ← TermChunkExtractor, TermChunk
+│   ├── concern_clusterer.py ← ConcernClusterer, Concern
+│   └── context_packer.py  ← ContextPacker (knapsack), render_concern_block()
+│
+├── llm/
+│   ├── base.py            ← BaseLLMClient ABC: complete(prompt) → str
+│   ├── openai_client.py   ← OpenAILLMClient (gpt-4o-mini, gpt-4o, …)
+│   ├── ollama_client.py   ← OllamaLLMClient (local, free)
+│   └── __init__.py        ← make_llm_client(), make_cluster_llm_client()
+│
 ├── retrieval/
 │   ├── retriever.py       ← CodeRetriever (embed query → ANN search)
 │   └── reranker.py        ← BaseReranker, ScoreReranker, CrossEncoderReranker
@@ -485,10 +616,15 @@ src/code_indexer/
 │   └── routes/
 │       ├── health.py      ← GET /health, GET /ping
 │       ├── index.py       ← POST /index/directory, POST /index/file, …
-│       └── search.py      ← POST /search, POST /search/rerank
+│       ├── search.py      ← POST /search, POST /search/rerank
+│       └── graph.py       ← POST /graph/index, GET /graph/stats,
+│                              POST /graph/callers, POST /graph/callees,
+│                              POST /graph/impact, POST /graph/context, …
 │
 └── cli/
-    └── main.py            ← click CLI: index, search, stats, serve
+    └── main.py            ← click CLI: index, search, stats, serve,
+                               graph index, graph callers, graph callees,
+                               graph context, graph stats
 ```
 
 ---
@@ -555,7 +691,34 @@ code-indexer search "error handler" --context --top-k 3
 code-indexer search "parse config" --json-output | jq '.results[0].chunk.path'
 ```
 
-### 5. Start the API server
+### 5. Build the knowledge graph
+
+The graph pipeline runs independently of the vector pipeline and produces
+structural edges (call graph, inheritance, dependency injection).
+
+```bash
+# Build the structural graph for the same codebase
+code-indexer graph index .
+
+# Summary output:
+#   Files processed: 247
+#   Symbols created: 1,543
+#   Edges created:   4,891  (CALLS + IMPORTS + INHERITS_FROM + INJECTS)
+#   Elapsed: 12.3s
+
+# Ask who calls a function
+code-indexer graph callers verify_token
+#   src/api/routes/auth.py:88  auth.routes.auth.login_handler  [function]
+#   src/middleware/auth.py:34  middleware.auth.require_auth     [function]
+
+# Get the full structural context for RAG (also outputs Mermaid diagram)
+code-indexer graph context verify_token
+
+# Impact analysis — what breaks if I change this?
+code-indexer graph callers verify_token --depth 3
+```
+
+### 6. Start the API server
 
 ```bash
 code-indexer serve
@@ -563,7 +726,7 @@ code-indexer serve
 # Swagger UI at   http://localhost:8000/docs
 ```
 
-### 6. Use the Python API directly
+### 7. Use the Python API directly
 
 ```python
 from code_indexer.core.config import get_settings
@@ -593,6 +756,29 @@ response = retriever.search(SearchQuery(
 
 for r in response.results:
     print(f"  [{r.score:.2f}] {r.chunk.path}:{r.chunk.start_line} — {r.chunk.name}")
+```
+
+**Graph API:**
+
+```python
+from code_indexer.graph.pipeline import GraphIndexingPipeline, build_graph_store
+
+settings = get_settings()
+graph_store = build_graph_store(settings)
+
+# Build the graph
+pipeline = GraphIndexingPipeline(settings=settings, graph_store=graph_store)
+result = pipeline.index_directory("./my-project")
+print(f"Symbols: {result.symbols_created}  Edges: {result.edges_created}")
+
+# Impact analysis — what breaks if verify_token changes?
+syms = graph_store.find_symbols_by_name("verify_token")
+impact = graph_store.get_impact_set(syms[0].id, min_confidence=0.6)
+print(impact.to_mermaid())   # renders in GitHub / Notion / VS Code
+
+# Structural context for an LLM prompt
+ctx = graph_store.get_symbol_context(syms[0].id)
+print(ctx.to_context_text())   # callers, callees, parent, imports, decorators
 ```
 
 ---
@@ -653,6 +839,26 @@ See `.env.example` for the complete list with comments.
 | `API_KEY` | `` | Bearer token auth (empty = disabled) |
 | `API_LOG_LEVEL` | `info` | `debug`, `info`, `warning`, `error` |
 
+### Graph Settings (`GRAPH_` prefix)
+
+| Variable | Default | Options |
+|---|---|---|
+| `GRAPH_PROVIDER` | `in_memory` | `in_memory`, `neo4j` |
+| `GRAPH_NEO4J_URL` | `bolt://localhost:7687` | Neo4j Bolt URL |
+| `GRAPH_NEO4J_USER` | `neo4j` | Neo4j username |
+| `GRAPH_NEO4J_PASSWORD` | `` | Neo4j password |
+| `GRAPH_MIN_CONFIDENCE` | `0.6` | Drop call edges below this score |
+
+### LLM Settings (`LLM_` prefix)
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `openai` | `openai`, `ollama` |
+| `LLM_MODEL` | `gpt-4o-mini` | Cheap model for bulk enrichment (expand, define, rank) |
+| `LLM_CLUSTER_MODEL` | `gpt-4o` | Strong model for concern clustering (one call per query) |
+| `LLM_API_KEY` | `` | OpenAI API key (required for `openai` provider) |
+| `LLM_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+
 ---
 
 ## API Reference
@@ -707,6 +913,49 @@ Response:
 | `POST` | `/search` | Bi-encoder vector similarity search |
 | `POST` | `/search/rerank` | Bi-encoder + cross-encoder reranking |
 
+### Graph
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/graph/index` | Build structural graph for a directory |
+| `GET` | `/graph/stats` | Symbol / edge counts by type |
+| `DELETE` | `/graph/clear` | Wipe the graph index |
+| `GET` | `/graph/symbol/{id}` | Fetch one symbol by ID |
+| `POST` | `/graph/symbol/search` | Find symbols by name |
+| `GET` | `/graph/file/{id}/symbols` | All symbols in a file |
+| `POST` | `/graph/callers` | BFS callers of a symbol |
+| `POST` | `/graph/callees` | BFS callees of a symbol |
+| `POST` | `/graph/call-path` | Shortest call path between two symbols |
+| `POST` | `/graph/import-graph` | Transitive import closure for a file |
+| `POST` | `/graph/subclasses` | Direct subclasses of a symbol |
+| `POST` | `/graph/superclasses` | Inheritance chain above a symbol |
+| `POST` | `/graph/context` | Full structural neighbourhood (+ Mermaid) |
+| `POST` | `/graph/impact` | Blast-radius analysis (+ Mermaid) |
+
+**POST /graph/impact** request:
+
+```json
+{
+  "symbol_id": "a1b2c3...",
+  "min_confidence": 0.6,
+  "depth": 5
+}
+```
+
+Response:
+
+```json
+{
+  "symbol": { "name": "verify_token", "kind": "method", "file_path": "src/auth/jwt.py" },
+  "direct_callers": [...],
+  "transitive_callers": [...],
+  "subclasses": [],
+  "importing_files": ["src/api/routes/auth.py"],
+  "affected_files": ["src/api/routes/auth.py", "src/middleware/auth.py"],
+  "mermaid": "flowchart TD\n    target[\"◆ verify_token [method]  ← CHANGED\"]..."
+}
+```
+
 **POST /search**
 
 ```json
@@ -759,10 +1008,16 @@ Response:
 code-indexer [OPTIONS] COMMAND [ARGS]...
 
 Commands:
-  index    Index a codebase directory
+  index    Index a codebase directory (vector pipeline)
   search   Search the indexed codebase
-  stats    Show index statistics
+  stats    Show vector index statistics
   serve    Start the API server
+  graph    Code knowledge graph commands (structural relationships)
+    index    Build structural graph for a directory
+    callers  Show what calls SYMBOL_NAME
+    callees  Show what SYMBOL_NAME calls
+    context  Full structural context for SYMBOL_NAME (for RAG)
+    stats    Show graph statistics
 ```
 
 ### `code-indexer index`
@@ -800,6 +1055,55 @@ Options:
   --min-score FLOAT     Minimum similarity score [default: 0.0]
   --context             Include surrounding context lines
   --json-output         Output raw JSON
+```
+
+### `code-indexer graph`
+
+```
+Usage: code-indexer graph COMMAND [ARGS]...
+
+  Code knowledge graph commands (structural relationships).
+
+Commands:
+  index    Build the structural graph for a directory.
+  callers  Show what calls SYMBOL_NAME.
+  callees  Show what SYMBOL_NAME calls.
+  context  Full structural context for SYMBOL_NAME (callers, callees, imports,
+           decorators) — formatted for direct use in LLM prompts.
+  stats    Show graph statistics (node / edge counts by type).
+```
+
+```bash
+# Build graph (default: in-memory; for persistence use neo4j)
+code-indexer graph index ./myrepo
+code-indexer graph index ./myrepo --provider neo4j --clear
+
+# Call graph traversal
+code-indexer graph callers verify_token --depth 2
+code-indexer graph callees handle_payment --depth 1 --json-output
+
+# Structural context (includes Mermaid flowchart)
+code-indexer graph context JWTHandler.verify_token
+```
+
+---
+
+## Graph Store Backend Comparison
+
+| Provider | Setup | Persistence | Scale | Recommended for |
+|---|---|---|---|---|
+| `in_memory` | None | RAM only | < 500k symbols | Development, CI, tests |
+| `neo4j` | Docker / Neo4j AuraDB | File / Cloud | Millions of nodes | Production, large monorepos |
+
+```bash
+# Run Neo4j locally with Docker
+docker run -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=none \
+  neo4j:5
+
+# Configure
+GRAPH_PROVIDER=neo4j
+GRAPH_NEO4J_URL=bolt://localhost:7687
 ```
 
 ---
@@ -1157,6 +1461,18 @@ make type-check  # mypy
 | **Cross-encoder** | Model that jointly processes query + document; more accurate but O(k) inference cost. |
 | **Upsert** | Insert-or-update: if the record exists (by ID), replace it; otherwise insert it. |
 | **Tree-sitter** | Incremental parser generator that produces CSTs for 100+ languages. |
+| **CALLS edge** | Graph edge: function A calls function B (extracted from AST call expressions). |
+| **IMPORTS edge** | Graph edge: file A imports file B (with module string, alias, is_relative metadata). |
+| **INHERITS_FROM edge** | Graph edge: class A extends class B. |
+| **INJECTS edge** | Graph edge: class A holds a typed reference to class B via constructor/field injection. |
+| **Katz centrality** | Node score based on how many things transitively depend on it — finds architectural hotspots. |
+| **Impact analysis** | "If I change X, what else might break?" — BFS over reversed CALLS/INHERITS_FROM/IMPORTS edges. |
+| **TermEnricher** | LLM component that expands abbreviated identifiers (`req` → `HTTP request`) and generates definitions. |
+| **TermChunk** | A focused LLM summary of one (function, term) pair — more precise than a whole-function chunk. |
+| **ConcernClusterer** | Groups retrieved TermChunks into 2–5 named semantic concerns using a capable LLM. |
+| **ContextPacker** | Knapsack-optimal selector that fits the best symbols within a token budget. |
+| **Mermaid** | Text format rendered as flowchart diagrams by GitHub, Notion, VS Code, etc. |
+| **Neo4j** | Graph database — stores nodes and edges, queried with Cypher (like SQL for graphs). |
 
 ---
 

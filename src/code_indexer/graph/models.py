@@ -501,11 +501,11 @@ class ImpactResult(BaseModel):
         Example output::
 
             flowchart TD
-                _target["◆ verify_token [method]  ← CHANGED"]:::changed
-                _dc_0["handle_request [function]"]
-                _dc_0 -->|calls| _target
-                _tc_0["middleware [function]"]
-                _tc_0 -.->|transitive| _target
+                target["◆ verify_token [method]  ← CHANGED"]:::changed
+                dc0["handle_request [function]"]
+                dc0 -->|calls| target
+                tc0["middleware [function]"]
+                tc0 -.->|transitive| target
                 classDef changed fill:#f96,stroke:#c33,color:#000
         """
         def _lbl(sym: "SymbolNode") -> str:
@@ -514,25 +514,25 @@ class ImpactResult(BaseModel):
         direct_ids: set[str] = {s.id for s in self.direct_callers}
         lines = ["flowchart TD"]
         lines.append(
-            f'    _target["◆ {_lbl(self.symbol)}  ← CHANGED"]:::changed'
+            f'    target["◆ {_lbl(self.symbol)}  ← CHANGED"]:::changed'
         )
 
         for i, sym in enumerate(self.direct_callers[:12]):
-            nid = f"_dc_{i}"
+            nid = f"dc{i}"
             lines.append(f'    {nid}["{_lbl(sym)}"]')
-            lines.append(f"    {nid} -->|calls| _target")
+            lines.append(f"    {nid} -->|calls| target")
 
         for i, sym in enumerate(self.transitive_callers[:12]):
             if sym.id in direct_ids:
                 continue
-            nid = f"_tc_{i}"
+            nid = f"tc{i}"
             lines.append(f'    {nid}["{_lbl(sym)}"]')
-            lines.append(f"    {nid} -.->|transitive| _target")
+            lines.append(f"    {nid} -.->|transitive| target")
 
         for i, sym in enumerate(self.subclasses[:6]):
-            nid = f"_sub_{i}"
+            nid = f"sub{i}"
             lines.append(f'    {nid}["{_lbl(sym)}"]')
-            lines.append(f"    {nid} -->|inherits| _target")
+            lines.append(f"    {nid} -->|inherits| target")
 
         lines.append("    classDef changed fill:#f96,stroke:#c33,color:#000")
         return "\n".join(lines)

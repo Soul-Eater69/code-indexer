@@ -319,15 +319,15 @@ Output:
 
 ```mermaid
 flowchart TD
-    _self["verify_token [method]"]
-    _caller_0["handle_request [function]"]
-    _caller_0 -->|calls| _self
-    _callee_0["decode_jwt [function]"]
-    _self -->|calls| _callee_0
-    _parent["JWTHandler [class]"]
-    _parent -->|contains| _self
-    _base_0["BaseHandler [class]"]
-    _self -->|inherits| _base_0
+    focal["verify_token [method]"]
+    caller0["handle_request [function]"]
+    caller0 -->|calls| focal
+    callee0["decode_jwt [function]"]
+    focal -->|calls| callee0
+    parent["JWTHandler [class]"]
+    parent -->|contains| focal
+    base0["BaseHandler [class]"]
+    focal -->|inherits| base0
 ```
 
 Which renders as a proper flowchart in any Mermaid-aware viewer.
@@ -347,11 +347,11 @@ Output:
 
 ```mermaid
 flowchart TD
-    _target["◆ verify_token [method]  ← CHANGED"]:::changed
-    _dc_0["handle_request [function]"]
-    _dc_0 -->|calls| _target
-    _tc_0["middleware [function]"]
-    _tc_0 -.->|transitive| _target
+    target["◆ verify_token [method]  ← CHANGED"]:::changed
+    dc0["handle_request [function]"]
+    dc0 -->|calls| target
+    tc0["middleware [function]"]
+    tc0 -.->|transitive| target
     classDef changed fill:#f96,stroke:#c33,color:#000
 ```
 
