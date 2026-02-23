@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -402,6 +403,58 @@ class TermEnricher:
                     symbol.qualified_name,
                 )
         return enriched
+
+    def enrich_all(
+        self,
+        symbols_with_source: list[tuple[SymbolNode, str]],
+        *,
+        concurrency: int = 20,
+        max_terms: int = 5,
+    ) -> dict[str, list[EnrichedTerm]]:
+        """Enrich multiple symbols concurrently using a thread pool.
+
+        Runs :meth:`enrich_symbol` for every (symbol, source) pair in
+        parallel.  Each worker makes 2 × ``max_terms`` LLM calls (expand +
+        define per token), so with ``concurrency=20`` those calls are
+        issued in batches of up to 20 at a time instead of sequentially.
+
+        Parameters
+        ----------
+        symbols_with_source:
+            List of ``(SymbolNode, source_text)`` pairs to process.
+        concurrency:
+            Maximum number of symbols to enrich simultaneously.
+            Match this to your API rate limit tier; default ``20`` is safe
+            for OpenAI Tier-1.  Reduce to ``1`` for local Ollama.
+        max_terms:
+            Forwarded to :meth:`enrich_symbol`.
+
+        Returns
+        -------
+        dict[str, list[EnrichedTerm]]
+            Mapping of ``symbol.id`` → enriched terms.  Symbols that fail
+            are mapped to an empty list rather than raising.
+        """
+        results: dict[str, list[EnrichedTerm]] = {}
+
+        def _worker(sym: SymbolNode, src: str) -> tuple[str, list[EnrichedTerm]]:
+            return sym.id, self.enrich_symbol(sym, src, max_terms=max_terms)
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_id = {
+                executor.submit(_worker, sym, src): sym.id
+                for sym, src in symbols_with_source
+            }
+            for future in as_completed(future_to_id):
+                sym_id = future_to_id[future]
+                try:
+                    _, terms = future.result()
+                    results[sym_id] = terms
+                except Exception:  # noqa: BLE001
+                    logger.debug("enrich_all: worker failed for symbol %s", sym_id)
+                    results[sym_id] = []
+
+        return results
 
     def _enrich_one(self, raw_name: str, source_text: str) -> EnrichedTerm | None:
         """Run LLM calls for a single token: expand then define."""

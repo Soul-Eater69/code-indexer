@@ -858,6 +858,7 @@ See `.env.example` for the complete list with comments.
 | `LLM_CLUSTER_MODEL` | `gpt-4o` | Strong model for concern clustering (one call per query) |
 | `LLM_API_KEY` | `` | OpenAI API key (required for `openai` provider) |
 | `LLM_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `LLM_CONCURRENCY` | `20` | Parallel threads for offline enrichment (`enrich_all` / `extract_all`) |
 
 ---
 

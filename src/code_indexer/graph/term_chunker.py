@@ -45,6 +45,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -222,6 +223,53 @@ class TermChunkExtractor:
                     term.expanded_name,
                 )
         return chunks
+
+    def extract_all(
+        self,
+        symbol_source_terms: list[tuple[SymbolNode, str, list[EnrichedTerm]]],
+        *,
+        concurrency: int = 20,
+    ) -> list[TermChunk]:
+        """Extract term chunks for multiple symbols concurrently.
+
+        Runs :meth:`extract` for every ``(symbol, source_text, terms)``
+        triple in parallel.  Because each call makes one LLM request per
+        term, parallelising across symbols gives the same throughput
+        improvement as :meth:`~TermEnricher.enrich_all`.
+
+        Parameters
+        ----------
+        symbol_source_terms:
+            List of ``(SymbolNode, source_text, terms)`` triples.
+        concurrency:
+            Maximum number of symbols to process simultaneously.
+            Default ``20`` — reduce to ``1`` for local Ollama.
+
+        Returns
+        -------
+        list[TermChunk]
+            All generated chunks from every symbol, in completion order.
+            Failed workers are skipped and logged at DEBUG level.
+        """
+        all_chunks: list[TermChunk] = []
+
+        def _worker(
+            sym: SymbolNode, src: str, terms: list[EnrichedTerm]
+        ) -> list[TermChunk]:
+            return self.extract(sym, src, terms)
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [
+                executor.submit(_worker, sym, src, terms)
+                for sym, src, terms in symbol_source_terms
+            ]
+            for future in as_completed(futures):
+                try:
+                    all_chunks.extend(future.result())
+                except Exception:  # noqa: BLE001
+                    logger.debug("extract_all: worker failed")
+
+        return all_chunks
 
     def _summarise_one(
         self,

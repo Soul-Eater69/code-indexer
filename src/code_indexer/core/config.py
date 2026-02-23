@@ -194,6 +194,9 @@ class LLMSettings(BaseSettings):
         base_url:       Base URL for Ollama server.
         max_tokens:     Default max output tokens per LLM call.
         temperature:    Sampling temperature (0 = deterministic).
+        concurrency:    Number of LLM calls to run in parallel during offline
+                        enrichment.  Higher values reduce wall-clock time but
+                        increase API rate-limit pressure.  Default: ``20``.
     """
 
     provider: Literal["openai", "ollama"] = "openai"
@@ -203,6 +206,7 @@ class LLMSettings(BaseSettings):
     base_url: str = "http://localhost:11434"
     max_tokens: int = Field(default=512, ge=16, le=4096)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    concurrency: int = Field(default=20, ge=1, le=200)
 
     model_config = SettingsConfigDict(env_prefix="LLM_", env_file=".env", extra="ignore")
 
